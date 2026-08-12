@@ -17,6 +17,9 @@ import TransactionDetailPopup from './TransactionDetailPopup';
 import QuantumrootTrackingService from '../../services/QuantumrootTrackingService';
 import WalletScreen from '../../components/ui/WalletScreen';
 import type { TransactionHistoryItem } from '../../types/types';
+import { isFusionTransaction } from '../../platform/desktop/fusionCoinDepth';
+import { useFusionDepthRevision } from '../../platform/desktop/useFusionDepthRevision';
+import { FusionBadge } from '../../components/FusionBadge';
 
 const EMPTY_TRANSACTIONS: TransactionHistoryItem[] = [];
 
@@ -29,6 +32,10 @@ const selectTransactions = createSelector(
 const TransactionHistory: React.FC = () => {
   const dispatch = useDispatch<AppDispatch>();
   const { wallet_id } = useParams<{ wallet_id: string }>();
+  const walletIdNum = Number(wallet_id);
+  const fusionDepthRev = useFusionDepthRevision(
+    Number.isFinite(walletIdNum) && walletIdNum > 0 ? walletIdNum : 0
+  );
   const transactions = useSelector((state: RootState) =>
     selectTransactions(state, wallet_id || '')
   );
@@ -163,7 +170,13 @@ const TransactionHistory: React.FC = () => {
             <EmptyState message="No transactions available yet." />
           ) : (
             <ul className="h-full space-y-3 overflow-y-auto overscroll-contain pr-1">
-              {paginatedTransactions.map((tx, id) => (
+              {paginatedTransactions.map((tx, id) => {
+                void fusionDepthRev;
+                const fused =
+                  Number.isFinite(walletIdNum) &&
+                  walletIdNum > 0 &&
+                  isFusionTransaction(walletIdNum, tx.tx_hash);
+                return (
                 <li key={id + tx.tx_hash}>
                   <button
                     type="button"
@@ -177,12 +190,19 @@ const TransactionHistory: React.FC = () => {
                         </div>
                         <div className="font-mono text-sm break-all wallet-text-strong">
                           {shortenTxHash(tx.tx_hash)}
+                          {fused && (
+                            <FusionBadge asTx className="ml-2" />
+                          )}
                         </div>
                       </div>
                       {tx.height > 0 ? (
-                        <StatusChip tone="success">Confirmed</StatusChip>
+                        <StatusChip tone="success">
+                          {fused ? 'Fused · Confirmed' : 'Confirmed'}
+                        </StatusChip>
                       ) : (
-                        <StatusChip tone="warning">Pending</StatusChip>
+                        <StatusChip tone="warning">
+                          {fused ? 'Fused · Unconfirmed' : 'Unconfirmed'}
+                        </StatusChip>
                       )}
                     </div>
                     <div className="mt-2 text-sm">
@@ -192,13 +212,16 @@ const TransactionHistory: React.FC = () => {
                         </span>
                       ) : (
                         <span className="wallet-muted">
-                          Awaiting confirmation
+                          {fused
+                            ? 'Broadcast — waiting for a block (height not yet in history)'
+                            : 'Awaiting confirmation'}
                         </span>
                       )}
                     </div>
                   </button>
                 </li>
-              ))}
+                );
+              })}
             </ul>
           )}
         </div>
