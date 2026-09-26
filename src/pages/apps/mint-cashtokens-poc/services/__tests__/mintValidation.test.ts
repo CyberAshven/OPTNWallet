@@ -198,8 +198,11 @@ describe('validateMintRequest', () => {
     ).toBeNull();
   });
 
-  it('allows only one new token per mint', () => {
-    const second: MintAppUtxo = { ...baseUtxo, tx_hash: 'h'.repeat(64) } as MintAppUtxo;
+  it('requires explicit shared metadata control consent for multiple new categories', () => {
+    const second: MintAppUtxo = {
+      ...baseUtxo,
+      tx_hash: 'h'.repeat(64),
+    } as MintAppUtxo;
     const secondDraft: MintOutputDraft = {
       ...baseDraft,
       id: 'd2',
@@ -210,8 +213,25 @@ describe('validateMintRequest', () => {
         ...validParams(),
         selectedUtxos: [baseUtxo, second],
         activeOutputDrafts: [baseDraft, secondDraft],
-        selectedSourceKeySet: new Set([baseDraft.sourceKey, secondDraft.sourceKey]),
+        selectedSourceKeySet: new Set([
+          baseDraft.sourceKey,
+          secondDraft.sourceKey,
+        ]),
       })
-    ).toBe('Create one new token per mint, so each gets its own metadata.');
+    ).toBe(
+      'Confirm shared metadata control for this batch; use separate transactions for independent control.'
+    );
+    expect(
+      validateMintRequest({
+        ...validParams(),
+        selectedUtxos: [baseUtxo, second],
+        activeOutputDrafts: [baseDraft, secondDraft],
+        selectedSourceKeySet: new Set([
+          baseDraft.sourceKey,
+          secondDraft.sourceKey,
+        ]),
+        allowSharedMetadataControl: true,
+      })
+    ).toBeNull();
   });
 });

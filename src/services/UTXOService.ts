@@ -593,7 +593,8 @@ const UTXOService = {
   // Note: utxosMap excludes tokens (by design in the manager),
   //       tokenUtxos holds token-carrying UTXOs.
   async fetchAllWalletUtxos(
-    walletId: number
+    walletId: number,
+    options?: { includeMetadataControls?: boolean }
   ): Promise<{ allUtxos: UTXO[]; tokenUtxos: UTXO[] }> {
     try {
       const manager = await UTXOManager();
@@ -652,7 +653,13 @@ const UTXOService = {
         []
       );
 
-      return { allUtxos, tokenUtxos };
+      const { filterMetadataControls } = await import('./BcmrControlService');
+      return {
+        allUtxos: options?.includeMetadataControls
+          ? allUtxos
+          : await filterMetadataControls(walletId, allUtxos),
+        tokenUtxos,
+      };
     } catch (e) {
       logError('UTXOService.fetchAllWalletUtxos', e, { walletId });
       return { allUtxos: [], tokenUtxos: [] };

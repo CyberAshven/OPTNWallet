@@ -447,7 +447,7 @@ describe('mintTransactions', () => {
     expect(returned?.token?.amount).toBe(5000n);
   });
 
-  it('buildMintPreview does not duplicate an authority the drafts already re-create', async () => {
+  it('buildMintPreview retains the original authority when a new authority goes to someone else', async () => {
     buildTransactionMock.mockImplementationOnce(async (outputs: unknown[]) => ({
       errorMsg: '',
       finalOutputs: outputs,
@@ -491,7 +491,9 @@ describe('mintTransactions', () => {
         }),
       ],
       changeAddress: 'bitcoincash:qchange',
-      sdkAddressBook: [],
+      sdkAddressBook: [
+        { address: 'bitcoincash:qchange', tokenAddress: 'bitcoincash:zchange' },
+      ],
       tokenOutputSats: 1000,
     });
 
@@ -500,7 +502,15 @@ describe('mintTransactions', () => {
     }>;
     expect(
       requested.filter((output) => output.token?.nft?.capability === 'minting')
-    ).toHaveLength(1);
+    ).toHaveLength(2);
+    expect(requested).toContainEqual(
+      expect.objectContaining({
+        recipientAddress: 'bitcoincash:zchange',
+        token: expect.objectContaining({
+          nft: { capability: 'minting', commitment: '' },
+        }),
+      })
+    );
   });
 
   it('buildMintPreview refuses a build that would destroy the minting NFT', async () => {

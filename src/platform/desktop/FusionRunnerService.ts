@@ -439,7 +439,13 @@ async function freshCoinSelection(
     (await reconcileActiveWalletUtxosForSpend(walletId, signal));
   if (!snapshot) return null;
 
-  const allCoins = Object.values(snapshot).flat().filter(Boolean) as UTXO[];
+  const { filterMetadataControls } = await import(
+    '../../services/BcmrControlService'
+  );
+  const allCoins = await filterMetadataControls(
+    walletId,
+    Object.values(snapshot).flat().filter(Boolean) as UTXO[]
+  );
 
   if (mode === 'server') {
     // 0-conf / height-0 fusion outputs are allowed (ACCEPT_UNCONFIRMED).

@@ -1,11 +1,17 @@
 /* tslint:disable */
 /* eslint-disable */
 
+export function bcmrApproveControl(request: string): string;
+
 /**
  * Build the registry to publish. Takes and returns JSON; see
  * `bcmr_author::AuthorRequest` and `bcmr_author::Authored` for the shapes.
  */
 export function bcmrAuthorRegistry(request_json: string): string;
+
+export function bcmrCheckSpend(raw: Uint8Array, records: string): void;
+
+export function bcmrControlView(record: string): string;
 
 /**
  * The parse bytecode of the default type-and-serial layout.
@@ -49,6 +55,8 @@ export function bcmrSuggestIdentity(category: string, has_nfts: boolean): string
  * Why `symbol` is not a valid ticker, or `undefined` when it is.
  */
 export function bcmrSymbolError(symbol: string): string | undefined;
+
+export function bcmrValidateControlRegistry(registry: string, categories: string, network: string): void;
 
 export function connectP2pkhLock(public_key: Uint8Array): Uint8Array;
 
@@ -254,7 +262,10 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly bcmrApproveControl: (a: number, b: number) => [number, number, number, number];
     readonly bcmrAuthorRegistry: (a: number, b: number) => [number, number, number, number];
+    readonly bcmrCheckSpend: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly bcmrControlView: (a: number, b: number) => [number, number, number, number];
     readonly bcmrDefaultParseBytecode: () => [number, number];
     readonly bcmrIpfsCid: (a: number, b: number) => [number, number];
     readonly bcmrParsableCommitment: (a: number, b: number) => [number, number];
@@ -262,6 +273,7 @@ export interface InitOutput {
     readonly bcmrSequentialCommitment: (a: number) => [number, number];
     readonly bcmrSuggestIdentity: (a: number, b: number, c: number) => [number, number, number, number];
     readonly bcmrSymbolError: (a: number, b: number) => [number, number];
+    readonly bcmrValidateControlRegistry: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
     readonly connectP2pkhLock: (a: number, b: number) => [number, number, number, number];
     readonly connectPublicKey: (a: number, b: number) => [number, number, number, number];
     readonly connectSignInput: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];

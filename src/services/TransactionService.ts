@@ -12,9 +12,10 @@ import ContractManager from '../apis/ContractManager/ContractManager';
 import type { ContractInstanceRow } from '../apis/ContractManager/ContractManager';
 import TransactionManager from '../apis/TransactionManager/TransactionManager';
 import { store } from '../state/store';
-import { logError } from '../utils/errorHandling';
+import { logError, toErrorMessage } from '../utils/errorHandling';
 import { isDeterministicBroadcastError } from '../utils/broadcastErrors';
 import { reservedOutpoints as reservedFusionOutpoints } from '../platform/desktop/fusionRoundState';
+import { checkBcmrBroadcast, type BcmrUpdate } from './BcmrControlService';
 import OutboundTransactionTracker, {
   deriveTrackedTxid,
 } from './OutboundTransactionTracker';
@@ -415,7 +416,8 @@ class TransactionService {
     contractFunctionInputs: Record<string, unknown> | null,
     changeAddress: string,
     selectedUtxos: UTXO[],
-    allowImplicitFungibleTokenBurn = false
+    allowImplicitFungibleTokenBurn = false,
+    bcmrUpdate?: BcmrUpdate
   ): Promise<{
     bytecodeSize: number;
     finalTransaction: string;
@@ -427,7 +429,8 @@ class TransactionService {
       contractFunctionInputs,
       changeAddress,
       selectedUtxos,
-      allowImplicitFungibleTokenBurn
+      allowImplicitFungibleTokenBurn,
+      bcmrUpdate
     );
   }
 
@@ -444,6 +447,11 @@ class TransactionService {
   ): Promise<BroadcastResult> {
     const currentWalletId =
       options?.walletId ?? store.getState().wallet_id.currentWalletId ?? null;
+    try {
+      await checkBcmrBroadcast(rawTX, currentWalletId ?? undefined);
+    } catch (error) {
+      return { txid: null, errorMessage: toErrorMessage(error) };
+    }
     const currentTxid = deriveTrackedTxid(rawTX);
     const activeOutbound = currentWalletId
       ? (await OutboundTransactionTracker.listActive(currentWalletId)).filter(
@@ -595,6 +603,11 @@ class TransactionService {
     const seenBatchOutpoints = new Set<string>();
 
     for (const request of requests) {
+      try {
+        await checkBcmrBroadcast(request.rawTX, currentWalletId ?? undefined);
+      } catch (error) {
+        return [{ txid: null, errorMessage: toErrorMessage(error) }];
+      }
       for (const utxo of request.spentInputs ?? []) {
         const outpointKey = `${utxo.tx_hash}:${utxo.tx_pos}`;
         if (reserved.has(outpointKey) || seenBatchOutpoints.has(outpointKey)) {

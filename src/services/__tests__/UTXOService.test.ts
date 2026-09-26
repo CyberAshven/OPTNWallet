@@ -18,6 +18,10 @@ const decodeTransactionMock = vi.fn();
 const getStateMock = vi.fn();
 const dispatchMock = vi.fn();
 
+vi.mock('../BcmrControlService', () => ({
+  filterMetadataControls: async (_walletId: number, coins: unknown[]) => coins,
+}));
+
 vi.mock('../WalletDiscoveryService', () => ({
   default: {
     ensureInitialAddressBatches: ensureInitialAddressBatchesMock,

@@ -626,6 +626,42 @@ fn author_err(e: crate::bcmr_author::AuthorError) -> JsValue {
     JsValue::from_str(&serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone()))
 }
 
+#[wasm_bindgen(js_name = bcmrApproveControl)]
+pub fn bcmr_approve_control(request: &str) -> Result<String, JsValue> {
+    let request = serde_json::from_str(request)
+        .map_err(|e| JsValue::from_str(&format!("Invalid control request: {e}")))?;
+    let control =
+        crate::bcmr_control::approve(request).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_json::to_string(&control).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = bcmrControlView)]
+pub fn bcmr_control_view(record: &str) -> Result<String, JsValue> {
+    let record = serde_json::from_str(record)
+        .map_err(|e| JsValue::from_str(&format!("Invalid control record: {e}")))?;
+    let view = crate::bcmr_control::view(&record).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_json::to_string(&view).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = bcmrCheckSpend)]
+pub fn bcmr_check_spend(raw: &[u8], records: &str) -> Result<(), JsValue> {
+    let records: Vec<crate::bcmr_control::Control> = serde_json::from_str(records)
+        .map_err(|e| JsValue::from_str(&format!("Invalid control records: {e}")))?;
+    crate::bcmr_control::check_spend(raw, &records).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = bcmrValidateControlRegistry)]
+pub fn bcmr_validate_control_registry(
+    registry: &str,
+    categories: &str,
+    network: &str,
+) -> Result<(), JsValue> {
+    let categories: Vec<String> =
+        serde_json::from_str(categories).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    crate::bcmr_control::validate_registry(registry, &categories, network_from(network)?)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 /// Build the registry to publish. Takes and returns JSON; see
 /// `bcmr_author::AuthorRequest` and `bcmr_author::Authored` for the shapes.
 #[wasm_bindgen(js_name = bcmrAuthorRegistry)]

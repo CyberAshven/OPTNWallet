@@ -100,6 +100,7 @@ type BuildMintPreviewParams = {
   sdkAddressBook: WalletAddressRecord[];
   tokenOutputSats: number;
   bcmrPublication?: MintBcmrPublication;
+  allowSharedMetadataControl?: boolean;
 };
 
 const BCMR_IDENTITY_OUTPUT_SATS = 1000n;
@@ -165,17 +166,24 @@ function assertMintPreservesAuthority(
   inputs: MintAppUtxo[],
   finalOutputs: TransactionOutput[],
   changeAddress: string,
+  addressBook: WalletAddressRecord[],
   needsIdentityOutput: boolean
 ): void {
+  const remaining = [...finalOutputs];
   for (const input of inputs) {
     if (!isMintingAuthorityMintSource(input)) continue;
     const category = input.token!.category;
-    const kept = finalOutputs.some(
+    const kept = remaining.findIndex(
       (output) =>
+        output.recipientAddress ===
+          tokenAddressFor(changeAddress, addressBook) &&
         output.token?.category === category &&
-        output.token.nft?.capability === 'minting'
+        output.token.nft?.capability === 'minting' &&
+        output.token.nft.commitment === (input.token!.nft?.commitment ?? '') &&
+        toBigIntAmount(output.token.amount) ===
+          toBigIntAmount(input.token!.amount)
     );
-    if (!kept) {
+    if (kept < 0) {
       throw new Error(
         `Refusing to build: the minting NFT for ${shortHash(
           category,
@@ -184,6 +192,7 @@ function assertMintPreservesAuthority(
         )} would be destroyed.`
       );
     }
+    remaining.splice(kept, 1);
   }
 
   if (needsIdentityOutput) {
@@ -256,6 +265,7 @@ export async function buildMintPreview({
   sdkAddressBook,
   tokenOutputSats,
   bcmrPublication,
+  allowSharedMetadataControl = false,
 }: BuildMintPreviewParams): Promise<{
   built: BuildResult;
   inputsForBuild: MintAppUtxo[];
@@ -278,6 +288,14 @@ export async function buildMintPreview({
   }
 
   const sourceByKey = new Map(mintInputs.map((u) => [utxoKey(u), u]));
+  if (
+    mintInputs.filter(isGenesisMintSource).length > 1 &&
+    !allowSharedMetadataControl
+  ) {
+    throw new Error(
+      'Confirm shared metadata control for this batch; use separate transactions for independent control.'
+    );
+  }
   const hasGenesisSource = mintInputs.some(isGenesisMintSource);
   if (bcmrPublication?.enabled && !hasGenesisSource) {
     // A publication only counts in a transaction that spends the identity
@@ -292,19 +310,9 @@ export async function buildMintPreview({
   const needsIdentityOutput = mintInputs.some((u) => u.tx_pos === 0);
 
   const authorityInputs = mintInputs.filter(isMintingAuthorityMintSource);
-  const authoritiesToReturn = authorityInputs.filter((authority) => {
-    const category = authority.token!.category;
-    // A drafted minting NFT of the same category already carries the
-    // authority forward; returning the input as well would duplicate it.
-    return !activeOutputDrafts.some((draft) => {
-      const src = sourceByKey.get(draft.sourceKey);
-      return (
-        draft.config.mintType === 'NFT' &&
-        draft.config.nftCapability === 'minting' &&
-        (src?.token?.category ?? src?.tx_hash) === category
-      );
-    });
-  });
+  // A newly drafted authority may go to another recipient. It does not
+  // replace custody of the source authority or any fungible amount it carries.
+  const authoritiesToReturn = authorityInputs;
 
   const mintSourceKeySet = new Set(mintInputs.map((u) => utxoKey(u)));
   const feeCandidates = selectFeeCandidates(flatUtxos, mintSourceKeySet);
@@ -419,6 +427,7 @@ export async function buildMintPreview({
     inputsForBuild,
     built.finalOutputs,
     changeAddress,
+    sdkAddressBook,
     needsIdentityOutput
   );
   if (bcmrPublication?.enabled) {

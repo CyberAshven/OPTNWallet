@@ -1,5 +1,6 @@
 import { TransactionOutput, UTXO } from '../../types/types';
 import TransactionService from '../../services/TransactionService';
+import { checkBcmrBuild } from '../../services/BcmrControlService';
 import { DUST, TOKEN_OUTPUT_SATS } from '../../utils/constants';
 import { toErrorMessage } from '../../utils/errorHandling';
 import { toTokenAwareCashAddress } from '../../utils/cashAddress';
@@ -77,6 +78,11 @@ export function createSimpleSendPlanner({
     inputs: UTXO[],
     outputs: TransactionOutput[]
   ): Promise<BuildResult> {
+    try {
+      await checkBcmrBuild(inputs, outputs);
+    } catch (error) {
+      return { ok: false, err: toErrorMessage(error) };
+    }
     // Electron Cash hardware path: plan outputs/fees without software keys;
     // device produces the signed serialization (ledger/trezor sign_transaction).
     if (hardwareWallet) {

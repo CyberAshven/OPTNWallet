@@ -35,6 +35,9 @@ import {
   waitForIpfsAvailability,
 } from '../../../services/IpfsService';
 import TransactionService from '../../../services/TransactionService';
+import { store } from '../../../state/store';
+import { approveBcmrControl } from '../../../services/BcmrControlService';
+import MetadataControls from './components/MetadataControls';
 import UTXOService from '../../../services/UTXOService';
 import { copyToClipboard } from '../../../utils/clipboard';
 import { sha256 } from '../../../utils/hash';
@@ -261,6 +264,9 @@ const MintCashTokensPoCApp: React.FC = () => {
     useState<ConfirmState>(initialConfirmState);
   const pendingConfirmActionRef = useRef<null | (() => Promise<void>)>(null);
   const [showBcmrPopup, setShowBcmrPopup] = useState(false);
+  const [publishMetadataNow, setPublishMetadataNow] = useState(false);
+  const [allowSharedMetadataControl, setAllowSharedMetadataControl] =
+    useState(false);
   // The registry exactly as the core wrote it, and the links it is published
   // under. Kept together so the bytes hashed are the bytes uploaded.
   const [bcmrAuthored, setBcmrAuthored] = useState<AuthoredBcmrRegistry | null>(
@@ -465,14 +471,13 @@ const MintCashTokensPoCApp: React.FC = () => {
 
   const selectedRecipientCount = orderedSelectedRecipients.length;
 
-  // Metadata is published with every new token, and only then: spending the
-  // genesis UTXO is what makes this transaction continue the new token's
-  // identity chain. Validation allows one genesis source per mint.
+  // Preserve control for every genesis, independently of publication timing.
   const genesisSources = useMemo(
     () => selectedUtxos.filter(isGenesisMintSource),
     [selectedUtxos]
   );
-  const bcmrEnabled = genesisSources.length > 0;
+  const bcmrEnabled = publishMetadataNow && genesisSources.length === 1;
+  useEffect(() => setAllowSharedMetadataControl(false), [selectedKeys]);
   const bcmrAuthbase =
     genesisSources.length === 1 ? genesisSources[0].tx_hash : '';
   const bcmrTokenCategory = bcmrAuthbase;
@@ -653,7 +658,8 @@ const MintCashTokensPoCApp: React.FC = () => {
   const nftLayoutForSource = useCallback(
     (source: MintAppUtxo | null): 'parsable' | 'sequential' | 'custom' => {
       if (!source) return 'custom';
-      if (isGenesisMintSource(source)) return bcmrNftKind;
+      if (isGenesisMintSource(source))
+        return bcmrEnabled ? bcmrNftKind : 'custom';
       const nfts = source.token?.BcmrTokenMetadata?.token?.nfts;
       if (!nfts) return 'custom';
       const bytecode = nfts.parse?.bytecode;
@@ -662,7 +668,7 @@ const MintCashTokensPoCApp: React.FC = () => {
         ? 'parsable'
         : 'custom';
     },
-    [bcmrNftKind]
+    [bcmrEnabled, bcmrNftKind]
   );
 
   const commitmentForSerial = useCallback(
@@ -819,7 +825,7 @@ const MintCashTokensPoCApp: React.FC = () => {
   // every numbered NFT's commitment is written, so rebuild those drafts.
   // Custom-hex drafts are the user's own bytes and stay as typed.
   useEffect(() => {
-    if (!genesisSourceKey) return;
+    if (!bcmrEnabled || !genesisSourceKey) return;
     setOutputDrafts((prev) => {
       let changed = false;
       const next = prev.map((draft) => {
@@ -840,7 +846,7 @@ const MintCashTokensPoCApp: React.FC = () => {
       });
       return changed ? next : prev;
     });
-  }, [bcmrNftKind, commitmentForSerial, genesisSourceKey]);
+  }, [bcmrEnabled, bcmrNftKind, commitmentForSerial, genesisSourceKey]);
 
   const removeOutputDraft = useCallback((id: string) => {
     setOutputDrafts((prev) => prev.filter((d) => d.id !== id));
@@ -1150,6 +1156,7 @@ const MintCashTokensPoCApp: React.FC = () => {
         activeOutputDrafts,
         selectedRecipientSet,
         selectedSourceKeySet,
+        allowSharedMetadataControl,
       });
       if (validationError) {
         setErrorMessage(validationError);
@@ -1179,6 +1186,7 @@ const MintCashTokensPoCApp: React.FC = () => {
       setStatus('Preparing transaction for review...');
 
       try {
+        const sessionGeneration = store.getState().wallet_id.sessionGeneration;
         const { built, inputsForBuild, feePaid } = await buildMintPreview({
           selectedUtxos,
           flatUtxos,
@@ -1187,7 +1195,22 @@ const MintCashTokensPoCApp: React.FC = () => {
           sdkAddressBook,
           tokenOutputSats: TOKEN_OUTPUT_SATS,
           bcmrPublication: bcmrEnabled ? publication : undefined,
+          allowSharedMetadataControl,
         });
+
+        const controlRequest = genesisSources.length
+          ? {
+              walletId,
+              network,
+              sessionGeneration,
+              transactionHex: built.finalTransaction,
+              address: changeAddress,
+              genesisCategories: genesisSources.map((source) => source.tx_hash),
+              registryJson: bcmrEnabled ? publication?.registryJson : undefined,
+              allowSharedControl: allowSharedMetadataControl,
+            }
+          : undefined;
+        if (controlRequest) await approveBcmrControl(controlRequest, false);
 
         openConfirm({
           title: `Confirm mint (${activeOutputDrafts.length} output${
@@ -1214,8 +1237,11 @@ const MintCashTokensPoCApp: React.FC = () => {
             setConfirmLoading(true);
             try {
               setStatus('Broadcasting mint transaction...');
+              if (controlRequest) await approveBcmrControl(controlRequest);
               const sent = await TransactionService.sendTransaction(
-                built.finalTransaction
+                built.finalTransaction,
+                inputsForBuild,
+                { walletId }
               );
               const sentTxid = sent?.txid ?? '';
               if (!sentTxid)
@@ -1275,6 +1301,9 @@ const MintCashTokensPoCApp: React.FC = () => {
       selectedRecipientSet,
       selectedSourceKeySet,
       bcmrEnabled,
+      allowSharedMetadataControl,
+      genesisSources,
+      network,
       bcmrImageUploadStatus.phase,
       bcmrRegistryUploadStatus.phase,
       setErrorMessage,
@@ -1645,6 +1674,12 @@ const MintCashTokensPoCApp: React.FC = () => {
         className={`flex-1 min-h-0 overflow-y-auto overscroll-contain pt-4 pr-1 ${contentClassName}`}
       >
         <div className="space-y-6">
+          <MetadataControls
+            walletId={walletId}
+            network={network}
+            address={changeAddress}
+            revision={txid}
+          />
           {/* Stepper */}
           <Stepper step={step} canGoTo={canGoToStep} onStep={setStep} />
 
@@ -1739,13 +1774,62 @@ const MintCashTokensPoCApp: React.FC = () => {
                         </Badge>
                       ) : null}
                     </div>
+                    {genesisSources.length > 0 ? (
+                      <div className="space-y-2">
+                        <label
+                          htmlFor="mint-metadata-timing"
+                          className="font-semibold"
+                        >
+                          Metadata publication
+                        </label>
+                        <select
+                          id="mint-metadata-timing"
+                          value={bcmrEnabled ? 'now' : 'later'}
+                          onChange={(event) =>
+                            setPublishMetadataNow(event.target.value === 'now')
+                          }
+                          className="wallet-input w-full"
+                          disabled={loading}
+                        >
+                          <option value="later">
+                            Add metadata later — preserve control
+                          </option>
+                          <option
+                            value="now"
+                            disabled={genesisSources.length !== 1}
+                          >
+                            Publish metadata with this mint
+                          </option>
+                        </select>
+                        <p className="text-sm wallet-muted">
+                          Metadata control stays in your wallet and is protected
+                          from payments and CashFusion in either case.
+                        </p>
+                        {genesisSources.length > 1 ? (
+                          <label className="flex gap-2 text-sm">
+                            <input
+                              type="checkbox"
+                              checked={allowSharedMetadataControl}
+                              disabled={loading}
+                              onChange={(event) =>
+                                setAllowSharedMetadataControl(
+                                  event.target.checked
+                                )
+                              }
+                            />
+                            These categories will share metadata control. I can
+                            publish one combined registry later. For independent
+                            control, mint each category in a separate
+                            transaction.
+                          </label>
+                        ) : null}
+                      </div>
+                    ) : null}
                     {bcmrEnabled ? (
                       <>
                         <p className="text-sm wallet-muted">
-                          {addonT(
-                            'module.bcmrAlwaysPublished',
-                            'Every new token is published with its metadata. The fields are prefilled; edit them if you like.'
-                          )}
+                          Metadata will be published with this mint. Review the
+                          prefilled fields before uploading.
                         </p>
                         <div className="text-sm">
                           <span className="font-semibold">
@@ -1791,10 +1875,9 @@ const MintCashTokensPoCApp: React.FC = () => {
                       </>
                     ) : (
                       <p className="text-sm wallet-muted">
-                        {addonT(
-                          'module.bcmrFromAuthority',
-                          'Minting from an existing token keeps its current metadata. Metadata is published when a new token is created.'
-                        )}
+                        {genesisSources.length
+                          ? 'No registry will be uploaded or published now. Use Add/update metadata after minting.'
+                          : 'Minting more NFTs keeps the existing metadata. Use Add/update metadata to change it.'}
                       </p>
                     )}
                   </div>

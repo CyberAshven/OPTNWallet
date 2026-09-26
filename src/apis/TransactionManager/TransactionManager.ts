@@ -28,6 +28,7 @@ import {
   txBytesFromHex,
 } from './feePolicy';
 import OutboundTransactionTracker from '../../services/OutboundTransactionTracker';
+import type { BcmrUpdate } from '../../services/BcmrControlService';
 
 function deriveTxidFromRawTx(rawTX: string): string | null {
   try {
@@ -211,7 +212,7 @@ export default function TransactionManager() {
     const derivedTxid = deriveTxidFromRawTx(rawTX);
     const walletId =
       walletIdOverride === undefined
-        ? (store.getState().wallet_id.currentWalletId ?? null)
+        ? store.getState().wallet_id.currentWalletId ?? null
         : walletIdOverride;
     const priorAttempt = derivedTxid
       ? await OutboundTransactionTracker.getByTxid(derivedTxid, walletId)
@@ -505,7 +506,8 @@ export default function TransactionManager() {
     _contractFunctionInputs: Record<string, unknown> | null,
     changeAddress: string,
     selectedUtxos: UTXO[],
-    allowImplicitFungibleTokenBurn = false
+    allowImplicitFungibleTokenBurn = false,
+    bcmrUpdate?: BcmrUpdate
   ): Promise<{
     bytecodeSize: number;
     finalTransaction: string;
@@ -514,6 +516,7 @@ export default function TransactionManager() {
   }> => {
     const txBuilder = TransactionBuilderHelper({
       allowImplicitFungibleTokenBurn,
+      bcmrUpdate,
     });
     const returnObj = {
       bytecodeSize: 0,

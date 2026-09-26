@@ -16,6 +16,7 @@ pub mod airgap;
 pub mod asert;
 pub mod bcmr;
 pub mod bcmr_author;
+pub mod bcmr_control;
 pub mod cashaddr;
 pub mod coins;
 pub mod conformance;

@@ -1,7 +1,10 @@
 /* tslint:disable */
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
+export const bcmrApproveControl: (a: number, b: number) => [number, number, number, number];
 export const bcmrAuthorRegistry: (a: number, b: number) => [number, number, number, number];
+export const bcmrCheckSpend: (a: number, b: number, c: number, d: number) => [number, number];
+export const bcmrControlView: (a: number, b: number) => [number, number, number, number];
 export const bcmrDefaultParseBytecode: () => [number, number];
 export const bcmrIpfsCid: (a: number, b: number) => [number, number];
 export const bcmrParsableCommitment: (a: number, b: number) => [number, number];
@@ -9,6 +12,7 @@ export const bcmrReadPublication: (a: number, b: number) => [number, number];
 export const bcmrSequentialCommitment: (a: number) => [number, number];
 export const bcmrSuggestIdentity: (a: number, b: number, c: number) => [number, number, number, number];
 export const bcmrSymbolError: (a: number, b: number) => [number, number];
+export const bcmrValidateControlRegistry: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number];
 export const connectP2pkhLock: (a: number, b: number) => [number, number, number, number];
 export const connectPublicKey: (a: number, b: number) => [number, number, number, number];
 export const connectSignInput: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];

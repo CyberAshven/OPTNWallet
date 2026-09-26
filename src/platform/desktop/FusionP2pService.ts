@@ -1133,7 +1133,7 @@ export async function runP2pFusion(
     let runInputs: Awaited<ReturnType<typeof gatherInputs>>;
     let fresh: PoolAnnouncement[];
     try {
-      const keysPromise = gatherInputs(opts.walletId, spendable).catch(
+      const keysPromise = gatherInputs(opts.walletId, spendable, opts.network).catch(
         (error) => {
           prepAbort.abort();
           throw error;

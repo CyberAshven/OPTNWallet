@@ -576,7 +576,7 @@ export function buildServerRunner(
       }
       reserveOutpoints(config.walletId, reservedForRound);
 
-      const inputs = await gatherInputs(config.walletId, coins);
+      const inputs = await gatherInputs(config.walletId, coins, config.network);
       if (signal?.aborted) throw new Error('fusion round cancelled');
 
       const sumIn = inputs.reduce((sum, input) => sum + input.value, 0);

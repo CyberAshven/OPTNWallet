@@ -20,6 +20,7 @@ type ValidateMintRequestParams = {
   activeOutputDrafts: MintOutputDraft[];
   selectedRecipientSet: ReadonlySet<string>;
   selectedSourceKeySet: ReadonlySet<string>;
+  allowSharedMetadataControl?: boolean;
 };
 
 export function validateMintRequest(
@@ -49,11 +50,11 @@ export function validateMintRequest(
   if (selectedSourceUtxos.length === 0) {
     return 'Select at least one source UTXO.';
   }
-  // Every new token is published with its own metadata, and a transaction
-  // carries at most one publication. Two genesis sources in one mint would
-  // leave one of the new tokens without any.
-  if (selectedSourceUtxos.filter(isGenesisMintSource).length > 1) {
-    return 'Create one new token per mint, so each gets its own metadata.';
+  if (
+    selectedSourceUtxos.filter(isGenesisMintSource).length > 1 &&
+    !params.allowSharedMetadataControl
+  ) {
+    return 'Confirm shared metadata control for this batch; use separate transactions for independent control.';
   }
   if (activeOutputDrafts.length === 0)
     return 'Add at least one output mapping in Amounts.';

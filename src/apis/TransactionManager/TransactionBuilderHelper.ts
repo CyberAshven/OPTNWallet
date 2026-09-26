@@ -13,9 +13,15 @@ import KeyService from '../../services/KeyService';
 import { PaperWalletSecretStore } from '../../services/PaperWalletSecretStore';
 import { deriveRpaUtxoSigningKey } from '../../services/RpaSpendKeyService';
 import { TOKEN_OUTPUT_SATS } from '../../utils/constants';
+import {
+  checkBcmrBuild,
+  checkBcmrBroadcast,
+  type BcmrUpdate,
+} from '../../services/BcmrControlService';
 
 type TransactionBuilderHelperOptions = {
   allowImplicitFungibleTokenBurn?: boolean;
+  bcmrUpdate?: BcmrUpdate;
 };
 
 export default function TransactionBuilderHelper(
@@ -225,6 +231,7 @@ export default function TransactionBuilderHelper(
    * Builds a transaction using selected UTXOs and outputs.
    */
   async function buildTransaction(utxos: UTXO[], outputs: TransactionOutput[]) {
+    await checkBcmrBuild(utxos, outputs, options.bcmrUpdate);
     // Preflight: fail early with clear errors for covenant ordering constraints
     validateAuthGuardShape(utxos, outputs);
 
@@ -392,6 +399,7 @@ export default function TransactionBuilderHelper(
   }
 
   const sendTransaction = async (tx: string) => {
+    await checkBcmrBroadcast(tx);
     // IMPORTANT: do not swallow broadcast errors
     const txid = await provider.sendRawTransaction(tx);
 

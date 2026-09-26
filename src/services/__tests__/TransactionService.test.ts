@@ -9,6 +9,12 @@ const retrieveKeysMock = vi.fn();
 const requestRefreshMock = vi.fn();
 const reservedFusionOutpointsMock = vi.fn();
 const refreshMultisigWalletUtxosMock = vi.fn();
+const checkBcmrBroadcastMock = vi.fn();
+
+// Custody validation has real-WASM coverage in BcmrControlService.test.ts.
+vi.mock('../BcmrControlService', () => ({
+  checkBcmrBroadcast: (...args: unknown[]) => checkBcmrBroadcastMock(...args),
+}));
 
 vi.mock('../../apis/TransactionManager/TransactionManager', () => ({
   default: () => ({
@@ -75,6 +81,24 @@ describe('TransactionService.sendTransaction', () => {
     retrieveKeysMock.mockResolvedValue([]);
     reservedFusionOutpointsMock.mockReturnValue(new Set());
     refreshMultisigWalletUtxosMock.mockResolvedValue({});
+    checkBcmrBroadcastMock.mockReset();
+    checkBcmrBroadcastMock.mockResolvedValue(undefined);
+  });
+
+  it('returns a custody error without broadcasting either a single send or a batch', async () => {
+    checkBcmrBroadcastMock.mockRejectedValue(
+      new Error('Protected metadata control')
+    );
+    const { default: TransactionService } = await import(
+      '../TransactionService'
+    );
+    const expected = { txid: null, errorMessage: 'Protected metadata control' };
+    expect(await TransactionService.sendTransaction('00aa')).toEqual(expected);
+    expect(
+      await TransactionService.sendTransactionBatch([{ rawTX: '00aa' }])
+    ).toEqual([expected]);
+    expect(sendTransactionMock).not.toHaveBeenCalled();
+    expect(trackAttemptMock).not.toHaveBeenCalled();
   });
 
   it('clears any pending outbound record when broadcast returns an error', async () => {

@@ -5,6 +5,7 @@
 import { cashAddressToLockingBytecode } from '@bitauth/libauth';
 
 import KeyService from '../../services/KeyService';
+import { assertMetadataInputsAvailable } from '../../services/BcmrControlService';
 import { Network } from '../../state/slices/networkSlice';
 import type { UTXO } from '../../types/types';
 import { binToHex } from '../../utils/hex';
@@ -31,8 +32,10 @@ export interface FusionOutcome {
  */
 export async function gatherInputs(
   walletId: number,
-  utxos: UTXO[]
+  utxos: UTXO[],
+  network: Network
 ): Promise<FusionRunInput[]> {
+  await assertMetadataInputsAvailable(walletId, utxos, network);
   const keys = await KeyService.retrieveKeys(walletId);
   const byAddress = new Map(keys.map((key) => [key.address, key.publicKey]));
 
