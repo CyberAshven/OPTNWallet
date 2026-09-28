@@ -6,6 +6,47 @@
  */
 export function addonLegacyGuestCallAllowed(module: string, method: string): boolean;
 
+/**
+ * Build the registry bytes to publish. The request/response shapes are
+ * defined by bcmr_author::AuthorRequest and bcmr_author::Authored.
+ */
+export function bcmrAuthorRegistry(request_json: string): string;
+
+/**
+ * Parse bytecode for the default type-and-serial layout.
+ */
+export function bcmrDefaultParseBytecode(): string;
+
+/**
+ * Deterministic raw CIDv1 for the supplied registry bytes.
+ */
+export function bcmrIpfsCid(content: Uint8Array): string;
+
+/**
+ * Default parsable NFT commitment as lowercase hex.
+ */
+export function bcmrParsableCommitment(type_byte: number, serial: number): string;
+
+/**
+ * Read a BCMR publication with the same parser used by the Rust metadata core.
+ */
+export function bcmrReadPublication(locking_bytecode: Uint8Array): string | undefined;
+
+/**
+ * Sequential NFT commitment as lowercase hex.
+ */
+export function bcmrSequentialCommitment(number: number): string;
+
+/**
+ * Default name/symbol suggestion for a token category.
+ */
+export function bcmrSuggestIdentity(category: string, has_nfts: boolean): string;
+
+/**
+ * Why a symbol is invalid, or undefined when valid.
+ */
+export function bcmrSymbolError(symbol: string): string | undefined;
+
 export function connectP2pkhLock(public_key: Uint8Array): Uint8Array;
 
 export function connectPublicKey(private_key: Uint8Array): Uint8Array;
@@ -276,6 +317,14 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly addonLegacyGuestCallAllowed: (a: number, b: number, c: number, d: number) => number;
+    readonly bcmrAuthorRegistry: (a: number, b: number) => [number, number, number, number];
+    readonly bcmrDefaultParseBytecode: () => [number, number];
+    readonly bcmrIpfsCid: (a: number, b: number) => [number, number];
+    readonly bcmrParsableCommitment: (a: number, b: number) => [number, number];
+    readonly bcmrReadPublication: (a: number, b: number) => [number, number];
+    readonly bcmrSequentialCommitment: (a: number) => [number, number];
+    readonly bcmrSuggestIdentity: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly bcmrSymbolError: (a: number, b: number) => [number, number];
     readonly connectP2pkhLock: (a: number, b: number) => [number, number, number, number];
     readonly connectPublicKey: (a: number, b: number) => [number, number, number, number];
     readonly connectSignInput: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
