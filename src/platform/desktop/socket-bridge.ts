@@ -27,12 +27,15 @@ function webviewSocketAllowed(url: string): boolean {
   }
 }
 
+/** The socket's event channel name, 128 bits from the platform CSPRNG. Every
+ *  webview the desktop ships on has getRandomValues, so there is no
+ *  Math.random fallback to quietly take over. */
 function eventKey(): string {
-  const random =
-    typeof crypto !== 'undefined' && 'randomUUID' in crypto
-      ? crypto.randomUUID().replace(/-/g, '')
-      : Math.random().toString(16).slice(2) + Date.now().toString(16);
-  return `ws-${random}`.slice(0, 64);
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const random = Array.from(bytes, (byte) =>
+    byte.toString(16).padStart(2, '0')
+  ).join('');
+  return `ws-${random}`;
 }
 
 type Listener = ((event: Event) => void) | null;
