@@ -37,10 +37,13 @@ import {
 } from '../DesktopWalletManager';
 import type { WalletFileV1 } from '../walletFile';
 import { resolveBiometricEnrollment } from '../biometricEnrollment';
+import { openWalletInEngine } from '../engineWalletBridge';
+import { Toast } from '../toast';
 import { DesktopWalletPickerActions } from './DesktopWalletPickerActions';
 import { WatchOnlyWalletPreview } from './WatchOnlyWalletPreview';
 import { HardwareWalletWizard } from './HardwareWalletWizard';
 import { useI18n } from '../../../i18n/useI18n';
+import { networkProfile, parseNetwork } from '../../../utils/networkProfile';
 
 interface WalletRow {
   id: number;
@@ -127,6 +130,17 @@ const DesktopLandingPage = () => {
   const location = useLocation();
   const dispatch = useDispatch();
   const currentNetwork = useSelector(selectCurrentNetwork);
+  // The holder's own app-lock choice, carried to the runtime when it opens the
+  // same wallet file. The runtime refuses a file from another interface until
+  // it has one, rather than adopting a default nobody picked.
+  //
+  // Read defensively: this page also renders in stores that carry only the
+  // slices it strictly needs, and an absent choice means there is nothing to
+  // carry rather than "zero minutes".
+  const autoLockMinutes = useSelector(
+    (state: { appLock?: { autoLockMinutes?: number } }) =>
+      state.appLock?.autoLockMinutes
+  );
   const { t } = useI18n();
 
   useEffect(() => {
@@ -297,7 +311,7 @@ const DesktopLandingPage = () => {
       const attempt = await runExclusiveWalletOpen(
         id,
         getCurrentWebviewWindow().label,
-        () => unlockWalletWithBiometric(id),
+        () => unlockWalletWithBiometric(id, autoLockMinutes),
         isWalletWindowOpen
       );
       if (attempt.status === 'held') {
@@ -308,6 +322,16 @@ const DesktopLandingPage = () => {
       if (attempt.status === 'rejected') {
         setError('Biometric unlock was not accepted.');
         return;
+      }
+      if (attempt.value.engineWarning) {
+        try {
+          await Toast.show({
+            text: attempt.value.engineWarning,
+            duration: 'long',
+          });
+        } catch {
+          // Feedback failure must not undo the completed unlock.
+        }
       }
       finishOpen(id, attempt.value);
     } catch (err) {
@@ -366,18 +390,15 @@ const DesktopLandingPage = () => {
       let preferredNetwork = currentNetwork;
       const { networkFromWalletFile } = await import('../walletFile');
       const fileNet = networkFromWalletFile(importFile);
-      if (fileNet === 'chipnet') preferredNetwork = Network.CHIPNET;
-      else if (fileNet === 'mainnet') preferredNetwork = Network.MAINNET;
+      const fileNetwork = parseNetwork(fileNet);
+      if (fileNetwork) preferredNetwork = fileNetwork;
       else if (importColdText) {
         try {
           const { parseEncryptedColdArchive, decryptColdArchive } =
             await import('../WalletColdExportService');
           const enc = parseEncryptedColdArchive(importColdText);
           const archive = await decryptColdArchive(enc, password);
-          if (archive.network === 'chipnet') preferredNetwork = Network.CHIPNET;
-          else if (archive.network === 'mainnet') {
-            preferredNetwork = Network.MAINNET;
-          }
+          preferredNetwork = parseNetwork(archive.network) ?? preferredNetwork;
         } catch {
           /* cold optional for network peek; import may still succeed later */
         }
@@ -413,6 +434,21 @@ const DesktopLandingPage = () => {
               ? `Wallet keys imported, but data file failed: ${coldErr.message}`
               : t('desktopWallet.importFailed')
           );
+        }
+      }
+      const engine = await openWalletInEngine(
+        result.walletId,
+        password,
+        autoLockMinutes
+      ).catch(() => ({
+        opened: false,
+        reason: 'Wallet opened, but the shared engine is unavailable.',
+      }));
+      if (!engine.opened && engine.reason) {
+        try {
+          await Toast.show({ text: engine.reason, duration: 'long' });
+        } catch {
+          // Feedback failure must not undo the completed file import.
         }
       }
       dispatch(setWalletId(result.walletId));
@@ -471,6 +507,27 @@ const DesktopLandingPage = () => {
       if (attempt.status === 'rejected') {
         setError(t('desktopWallet.incorrectFilePassword'));
         return;
+      }
+      // Open the same file in the Rust runtime so the shared engine can
+      // synchronize this account through the multi-source chain stack. Both
+      // sides read the same `.optn`; this is the same wallet, not a copy.
+      // Best-effort: the wallet is already open here, so a runtime that
+      // declines must not fail an unlock the user just completed.
+      const engine = await openWalletInEngine(
+        openingId,
+        password,
+        autoLockMinutes
+      );
+      if (!engine.opened && engine.reason) {
+        console.warn(
+          '[DesktopLandingPage] engine wallet not opened:',
+          engine.reason
+        );
+        try {
+          await Toast.show({ text: engine.reason, duration: 'long' });
+        } catch {
+          // Feedback failure must not undo the completed unlock.
+        }
       }
       finishOpen(openingId, attempt.value);
     } catch (err) {
@@ -563,7 +620,7 @@ const DesktopLandingPage = () => {
               <p className="text-sm wallet-muted">
                 Enter this wallet file's password
                 {importFile.network
-                  ? ` · ${importFile.network === 'chipnet' ? 'Chipnet' : 'Mainnet'}`
+                  ? ` · ${networkProfile(parseNetwork(importFile.network) ?? Network.MAINNET).label}`
                   : ''}
                 . If this wallet is already saved, it will be opened — not
                 duplicated.
@@ -631,9 +688,7 @@ const DesktopLandingPage = () => {
                     <p className="text-[10px] wallet-muted">
                       #{w.id}
                       {' · '}
-                      {w.networkType === Network.CHIPNET
-                        ? t('settingsNetwork.chipnet')
-                        : t('settingsNetwork.mainnet')}
+                      {t(networkProfile(w.networkType).labelKey)}
                       {w.walletType === 'watch-only' && (
                         <span className="ml-1.5 rounded border border-[var(--wallet-border)] px-1 py-px text-[9px] uppercase tracking-wide">
                           Watch-only
@@ -682,10 +737,7 @@ const DesktopLandingPage = () => {
                         name:
                           w.wallet_name ||
                           t('desktopWallet.walletNumber', { id: w.id }),
-                        network:
-                          w.networkType === Network.CHIPNET
-                            ? t('settingsNetwork.chipnet')
-                            : t('settingsNetwork.mainnet'),
+                        network: t(networkProfile(w.networkType).labelKey),
                         id: w.id,
                       })}
                     </p>

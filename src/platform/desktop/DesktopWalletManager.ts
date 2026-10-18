@@ -46,7 +46,9 @@ import {
   deriveBchStandardXpubs,
   getBchAccountPath,
   normalizeBchAccountPath,
+  parseBchAccountPath,
 } from '../../services/HdWalletService';
+import { openWalletInEngine } from './engineWalletBridge';
 import {
   autoSaveWalletFile,
   parseWalletFile,
@@ -67,6 +69,7 @@ import {
   walletPasswordTooShortMessage,
 } from './passwordPolicy';
 
+import { cashAddressPrefix, parseNetwork } from '../../utils/networkProfile';
 const BIO_DOMAIN = 'com.optilabs.wallet';
 const bioName = (walletId: number) => `optn-wallet-bio-${walletId}`;
 const NETWORK_CLEANUP_VERSION = 1;
@@ -171,12 +174,7 @@ async function findWalletForDerivedAddress(args: {
   let matchingWalletId: number | null = null;
   while (query.step()) {
     const row = query.getAsObject() as Record<string, unknown>;
-    const rowNetwork =
-      row.networkType === Network.MAINNET
-        ? Network.MAINNET
-        : row.networkType === Network.CHIPNET
-          ? Network.CHIPNET
-          : null;
+    const rowNetwork = parseNetwork(row.networkType) ?? null;
     if (rowNetwork !== args.network || row.walletType !== args.walletType) {
       continue;
     }
@@ -357,7 +355,7 @@ export async function createWalletWithPassword(
       encryptedMnemonic,
       encryptedPassphrase,
       kdfSalt: bytesToBase64(salt),
-      network: network === Network.CHIPNET ? 'chipnet' : 'mainnet',
+      network,
       derivationPath: resolvedDerivationPath,
       derivationPathSource: resolvedDerivationPathSource,
     });
@@ -630,7 +628,7 @@ export async function purgeCrossNetworkData(
     // database genuinely cannot support the current schema.
   }
 
-  const keep = network === Network.MAINNET ? 'bitcoincash:%' : 'bchtest:%';
+  const keep = `${cashAddressPrefix(network)}:%`;
   let removed = 0;
   const del = (sql: string, params: (string | number)[]) => {
     db.run(sql, params);
@@ -789,20 +787,15 @@ export async function openWalletWithPassword(
   // derivation here.
   if (info.walletType === WalletType.STANDARD && net) {
     const { default: KeyService } = await import('../../services/KeyService');
-    await KeyService.bootstrapInitialAddressBatch(walletId, 0, 1);
+    const { accountIndex } = parseBchAccountPath(info.derivation_path);
+    await KeyService.bootstrapInitialAddressBatch(walletId, accountIndex, 1);
   }
   return info;
 }
 
-/** Only MAINNET/CHIPNET; never invent chipnet as a fallback. */
+/** A known network name; never invents one as a fallback. */
 function resolveWalletNetworkStrict(networkType: unknown): Network | null {
-  if (networkType === Network.MAINNET || networkType === 'mainnet') {
-    return Network.MAINNET;
-  }
-  if (networkType === Network.CHIPNET || networkType === 'chipnet') {
-    return Network.CHIPNET;
-  }
-  return null;
+  return parseNetwork(networkType) ?? null;
 }
 
 /** True when this watch-only (or any) wallet requires a password to open. */
@@ -1053,12 +1046,7 @@ export async function buildWalletFileContents(
   // that import would misinterpret as a standard seed wallet.
   if (!walletFileType || !supportsWalletFileV1Type(walletFileType)) return null;
 
-  const networkType =
-    row.networkType === Network.CHIPNET
-      ? Network.CHIPNET
-      : row.networkType === Network.MAINNET
-        ? Network.MAINNET
-        : null;
+  const networkType = parseNetwork(row.networkType) ?? null;
   if (!networkType) return null;
 
   const { serializeWalletFile } = await import('./walletFile');
@@ -1073,7 +1061,7 @@ export async function buildWalletFileContents(
     encryptedPassphrase:
       typeof row.passphrase === 'string' ? row.passphrase : '',
     kdfSalt: bytesToBase64(saltBytes),
-    network: networkType === Network.CHIPNET ? 'chipnet' : 'mainnet',
+    network: networkType,
     derivationPath:
       typeof row.derivation_path === 'string' ? row.derivation_path : undefined,
     derivationPathSource:
@@ -1133,9 +1121,9 @@ export async function findWalletByKeystore(
   if (q.step()) {
     const row = q.getAsObject() as Record<string, unknown>;
     const id = typeof row.id === 'number' ? row.id : Number(row.id);
-    const rowNetwork = row.networkType;
+    const rowNetwork = parseNetwork(row.networkType);
     if (Number.isSafeInteger(id) && id > 0) {
-      if (rowNetwork !== Network.MAINNET && rowNetwork !== Network.CHIPNET) {
+      if (!rowNetwork) {
         return null;
       }
       hit = {
@@ -1210,17 +1198,12 @@ export async function importWalletFile(
 
   const { networkFromWalletFile } = await import('./walletFile');
   const fileNetwork = networkFromWalletFile(file);
-  if (network !== Network.MAINNET && network !== Network.CHIPNET) {
+  if (!parseNetwork(network)) {
     throw new Error(
       'Cannot import wallet file with an unknown target network.'
     );
   }
-  const resolvedNetwork =
-    fileNetwork === 'chipnet'
-      ? Network.CHIPNET
-      : fileNetwork === 'mainnet'
-        ? Network.MAINNET
-        : network;
+  const resolvedNetwork = parseNetwork(fileNetwork) ?? network;
 
   const walletId = await createWalletWithPassword({
     name: file.name,
@@ -1521,8 +1504,9 @@ export async function disableWalletBiometric(walletId: number): Promise<void> {
  * instead of a generic "cancelled or failed".
  */
 export async function unlockWalletWithBiometric(
-  walletId: number
-): Promise<WalletMetadata> {
+  walletId: number,
+  autoLockMinutes?: number
+): Promise<WalletMetadata & { engineWarning?: string }> {
   let result: Awaited<ReturnType<typeof bioGetData>>;
   try {
     result = await bioGetData({
@@ -1553,7 +1537,17 @@ export async function unlockWalletWithBiometric(
       'The saved password no longer opens this wallet. Turn biometric off and on again to re-save it.'
     );
   }
-  return info;
+  // Use the credential already released by this OS prompt; return public
+  // metadata and feedback only, never the credential or a cache accessor.
+  const engine = await openWalletInEngine(
+    walletId,
+    result.data,
+    autoLockMinutes
+  ).catch(() => ({
+    opened: false,
+    reason: 'Wallet opened, but the shared engine is unavailable.',
+  }));
+  return { ...info, engineWarning: engine.opened ? undefined : engine.reason };
 }
 
 /**

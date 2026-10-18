@@ -4,10 +4,11 @@ use crate::{dispatch_action, qr::encode_address_qr, UiTransport};
 use leptos::prelude::*;
 use optn_app::{
     assets_view_model, chrome_network_label, chrome_network_pill, coins_view_model,
-    flipstarter_view_model, format_bch, fundme_view_model, history_view_model, nfts_view_model,
-    parse_bch, portfolio_totals, product_nav, sample_chipnet_campaign_blob, AppAction, AppRoute,
+    flipstarter_view_model, format_bch, fundme_view_model, header_checkpoint_label,
+    history_view_model, nfts_view_model, parse_bch, portfolio_totals, product_nav,
+    provider_health_summary, sample_chipnet_campaign_blob, snapshot_age_label, AppAction, AppRoute,
     AppState, Coin, FreezeReason, HistoryEntry, HistoryKind, Network, Outpoint, OwnedCategory,
-    OwnedNft, PledgeStatus, ProductNavItem, SpendKind, WalletKind,
+    OwnedNft, PledgeStatus, ProductNavItem, SpendKind, TokenIdentity, WalletKind,
 };
 use optn_transport::TransportError;
 
@@ -168,8 +169,11 @@ fn WalletSyncControl(transport: UiTransport, state: RwSignal<AppState>) -> impl 
             <p class="muted">{move || {
                 let sync = state.get().wallet_sync;
                 match (sync.source, sync.evidence) {
-                    (Some(source), Some(evidence)) => format!("{source} · {evidence}{}",
-                        sync.tip_height.map(|height| format!(" · tip {height}")).unwrap_or_default()),
+                    (Some(source), Some(evidence)) => format!("{source} · {evidence}{}{}",
+                        sync.tip_height.map(|height| format!(" · tip {height}")).unwrap_or_default(),
+                        sync.snapshot_at_unix_ms
+                            .map(|at| format!(" · {}", snapshot_age_label(at, now_ms())))
+                            .unwrap_or_default()),
                     _ if sync.refreshing => "Synchronizing this HD account through the selected source.".into(),
                     _ => "Select a chain source in Settings, then refresh this HD account.".into(),
                 }
@@ -180,6 +184,14 @@ fn WalletSyncControl(transport: UiTransport, state: RwSignal<AppState>) -> impl 
                     format!("Reported confirmed: {} · pending change: {:+} sats",
                         format_bch(sync.confirmed_sats.unwrap_or_default()), sync.pending_sats)
                 }}</p>
+            </Show>
+            <Show when=move || state.get().wallet_sync.header_checkpoint.is_some()>
+                <p class="muted">{move || state.get().wallet_sync.header_checkpoint
+                    .as_ref().map(header_checkpoint_label).unwrap_or_default()}</p>
+            </Show>
+            <Show when=move || provider_health_summary(&state.get().wallet_sync.providers).is_some()>
+                <p class="muted">{move || provider_health_summary(&state.get().wallet_sync.providers)
+                    .unwrap_or_default()}</p>
             </Show>
             <p class="muted" role="status">{move || error.get().or(state.get().wallet_sync.error).unwrap_or_default()}</p>
             <button class="text-link" type="button" on:click=move |_|
@@ -206,9 +218,6 @@ pub fn WalletHome(transport: UiTransport, state: RwSignal<AppState>) -> impl Int
                     <h1 class="balance">
                         {move || {
                             let current = state.get();
-                            // wallet_sync counts the HD addresses the chain sync walks;
-                            // RPA coins live at one-time addresses it never visits, so
-                            // they are still added rather than already included.
                             current.wallet_sync.total_sats().and_then(|total| total.checked_add(portfolio_totals(&current).stealth_sats))
                                 .map(format_bch).unwrap_or_else(|| "Balance unknown".into())
                         }}
@@ -501,7 +510,9 @@ fn OwnedCategories(transport: UiTransport, state: RwSignal<AppState>) -> impl In
                         // Raw until BCMR resolution names it. Showing the
                         // category is what keeps an unresolved token visible
                         // instead of making an owned asset disappear.
-                        <p class="source-title mono">{short_hex(&category.category_hex)}</p>
+                        <p class="source-title">
+                            {category_label(&category.identity, &category.category_hex)}
+                        </p>
                         <p class="muted">
                             {format!(
                                 "{} · {} coin(s){}",
@@ -553,7 +564,9 @@ pub fn NftsPage(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoV
                             let:nft
                         >
                             <article class="panel">
-                                <p class="source-title mono">{short_hex(&nft.category_hex)}</p>
+                                <p class="source-title">
+                                    {category_label(&nft.identity, &nft.category_hex)}
+                                </p>
                                 <p class="muted">
                                     {if nft.commitment_hex.is_empty() {
                                         "No commitment".to_string()
@@ -574,6 +587,23 @@ pub fn NftsPage(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoV
                 </Show>
             </section>
         </WalletChrome>
+    }
+}
+
+/// A token's name where one is verified, and the category itself otherwise.
+///
+/// The caveat travels with the name. "Bitcats" and "Bitcats (last known)" are
+/// different claims, and the holder deciding whether to spend is the person who
+/// needs them to look different.
+fn category_label(identity: &Option<TokenIdentity>, category_hex: &str) -> String {
+    match identity {
+        Some(identity) => match identity.caveat() {
+            Some(caveat) => format!("{} ({caveat})", identity.name),
+            None => identity.name.clone(),
+        },
+        // Shown as itself rather than hidden: an unresolved token is still
+        // owned, and waiting on a web server is not a reason to lose it.
+        None => short_hex(category_hex),
     }
 }
 
@@ -635,7 +665,11 @@ fn CoinRow(
     let outpoint = coin.outpoint();
     let frozen = coin.is_reserved();
     let token_protected = coin.token().is_some();
-    let output_protected = token_protected || coin.value_sats() == 0;
+    let output_protected = token_protected
+        || coin.value_sats() == 0
+        || coin
+            .freeze()
+            .is_some_and(|reason| !reason.is_user_reversible());
     let status = match coin.freeze() {
         None if token_protected => "CashTokens (protected)".to_string(),
         None if coin.value_sats() == 0 => "Zero-value output".to_string(),
@@ -644,6 +678,7 @@ fn CoinRow(
         Some(FreezeReason::FlipstarterPledge) => "Flipstarter pledge".into(),
         Some(FreezeReason::Authhead) => "Authhead".into(),
         Some(FreezeReason::FusionInFlight) => "Fusing".into(),
+        Some(FreezeReason::ExternalPayment) => "Reserved for payment".into(),
     };
     let label = coin.label().unwrap_or("").to_owned();
     let has_label = !label.is_empty();
@@ -1231,6 +1266,179 @@ pub fn ReceivePage(transport: UiTransport, state: RwSignal<AppState>) -> impl In
     }
 }
 
+#[derive(Clone, Copy)]
+struct AirgapView {
+    response: RwSignal<Option<optn_transport::AirgapResponse>>,
+    error: RwSignal<Option<String>>,
+    busy: RwSignal<bool>,
+    copied: RwSignal<Option<String>>,
+}
+
+impl AirgapView {
+    fn submit(
+        self,
+        transport: UiTransport,
+        state: RwSignal<AppState>,
+        request: optn_transport::AirgapRequest,
+    ) {
+        if self.busy.get_untracked() {
+            return;
+        }
+        self.busy.set(true);
+        self.error.set(None);
+        self.copied.set(None);
+        let before = state.get_untracked();
+        let binding = (before.wallet, before.lock.unlock_epoch, before.network);
+        let cancel = matches!(request, optn_transport::AirgapRequest::Cancel);
+        let transport = transport.get_value();
+        leptos::task::spawn_local(async move {
+            let result = transport.airgap(request).await;
+            // Read the authoritative state after IPC, including a concurrent lock.
+            if let Ok(snapshot) = transport.snapshot().await {
+                crate::apply_snapshot(state, snapshot);
+            } else {
+                self.response.try_set(None);
+                self.error.try_set(Some(
+                    "Could not confirm wallet state. Refresh and prepare again.".into(),
+                ));
+                self.busy.try_set(false);
+                return;
+            }
+            let Some(current) = state.try_get_untracked() else {
+                return;
+            };
+            if binding != (current.wallet, current.lock.unlock_epoch, current.network) {
+                self.response.try_set(None);
+                self.busy.try_set(false);
+                return;
+            }
+            match result {
+                Ok(response) => {
+                    self.response
+                        .try_set(if cancel { None } else { Some(response) });
+                }
+                Err(TransportError::Other(message) | TransportError::InvalidData(message)) => {
+                    self.error.try_set(Some(message));
+                }
+                Err(_) => {
+                    self.error.try_set(Some("Air-gap signing is unavailable. Open a saved watch-only wallet and refresh it.".into()));
+                }
+            }
+            self.busy.try_set(false);
+        });
+    }
+
+    fn copy(self, transport: UiTransport, raw: bool) {
+        let Some(response) = self.response.get_untracked() else {
+            return;
+        };
+        let text = if raw {
+            response.raw_transaction_hex
+        } else {
+            Some(response.psbt_hex)
+        };
+        let Some(text) = text else {
+            return;
+        };
+        let transport = transport.get_value();
+        leptos::task::spawn_local(async move {
+            let message = match transport.write_clipboard(text).await {
+                Ok(()) if raw => "Verified transaction copied. It has not been sent.",
+                Ok(()) => "Unsigned PSBT copied.",
+                Err(_) => "Could not copy. Select and copy the text below.",
+            };
+            self.copied.try_set(Some(message.into()));
+        });
+    }
+}
+
+#[component]
+fn AirgapSendPanel(
+    transport: UiTransport,
+    state: RwSignal<AppState>,
+    destination: RwSignal<String>,
+    amount: RwSignal<String>,
+    chosen_coin: RwSignal<Option<Outpoint>>,
+) -> impl IntoView {
+    let ui = AirgapView {
+        response: RwSignal::new(None),
+        error: RwSignal::new(None),
+        busy: RwSignal::new(false),
+        copied: RwSignal::new(None),
+    };
+    let signed = RwSignal::new(String::new());
+    let review = RwSignal::new(String::new());
+    let binding = Memo::new(move |_| {
+        let current = state.get();
+        (current.wallet, current.lock.unlock_epoch, current.network)
+    });
+    Effect::new(move |_| {
+        binding.track();
+        ui.response.set(None);
+        signed.set(String::new());
+        review.set(String::new());
+        ui.copied.set(None);
+    });
+    view! {
+        <section data-testid="airgap-send">
+            <button class="primary" type="button" disabled=move || ui.busy.get()
+                on:click=move |_| {
+                    let sats = match parse_bch(&amount.get_untracked()) {
+                        Ok(sats) => sats,
+                        Err(error) => { ui.error.set(Some(error.to_string())); return; }
+                    };
+                    ui.response.set(None);
+                    signed.set(String::new());
+                    review.set(format!("{} to {}", format_bch(sats), destination.get_untracked()));
+                    ui.submit(transport, state, optn_transport::AirgapRequest::Prepare {
+                        destination: destination.get_untracked(), amount_sats: sats,
+                        coin: chosen_coin.get_untracked().map(|coin| coin.to_string()),
+                    });
+                }>
+                {move || if ui.busy.get() { "Working…" } else { "Prepare unsigned transaction" }}
+            </button>
+            <Show when=move || ui.response.get().is_some()>
+                <article class="panel">
+                    <h2>"Sign with SeedCash"</h2>
+                    <p class="mono">{move || review.get()}</p>
+                    <p>{move || ui.response.get().map(|r| format!("Fee: {} sats · Change: {} sats", r.fee_sats, r.change_sats)).unwrap_or_default()}</p>
+                    <p class="mono">{move || ui.response.get().and_then(|r| r.change_address).unwrap_or_default()}</p>
+                    <label class="field"><span>"Unsigned PSBT (hex)"</span>
+                        <textarea readonly=true spellcheck="false" prop:value=move || ui.response.get().map(|r| r.psbt_hex).unwrap_or_default() />
+                    </label>
+                    <button class="secondary" type="button" on:click=move |_| ui.copy(transport, false)>"Copy unsigned PSBT"</button>
+                    <p class="muted">"Animated QR export is not available on this interface yet."</p>
+                    <label class="field"><span>"Signed PSBT from SeedCash (hex)"</span>
+                        <textarea spellcheck="false" maxlength="262144" prop:value=move || signed.get()
+                            on:input=move |event| signed.set(event_target_value(&event)) />
+                    </label>
+                    <button class="primary" type="button" disabled=move || ui.busy.get() || signed.get().trim().is_empty()
+                        on:click=move |_| {
+                            if let Some(response) = ui.response.get_untracked() {
+                                ui.response.update(|value| { if let Some(value) = value { value.raw_transaction_hex = None; value.txid = None; } });
+                                ui.submit(transport, state, optn_transport::AirgapRequest::Finalize {
+                                    request_id: response.request_id, signed_psbt_hex: signed.get_untracked(),
+                                });
+                            }
+                        }>"Verify signed transaction"</button>
+                    <Show when=move || ui.response.get().is_some_and(|r| r.raw_transaction_hex.is_some())>
+                        <h2>"Verified transaction — not sent"</h2>
+                        <p class="mono">{move || ui.response.get().and_then(|r| r.txid).unwrap_or_default()}</p>
+                        <label class="field"><span>"Finalized raw transaction (hex)"</span>
+                            <textarea readonly=true spellcheck="false" prop:value=move || ui.response.get().and_then(|r| r.raw_transaction_hex).unwrap_or_default() />
+                        </label>
+                        <button class="secondary" type="button" on:click=move |_| ui.copy(transport, true)>"Copy verified transaction"</button>
+                    </Show>
+                    <button class="secondary" type="button" disabled=move || ui.busy.get()
+                        on:click=move |_| { signed.set(String::new()); ui.submit(transport, state, optn_transport::AirgapRequest::Cancel); }>"Cancel transaction"</button>
+                </article>
+            </Show>
+            <Show when=move || ui.error.get().is_some()><p role="alert">{move || ui.error.get().unwrap_or_default()}</p></Show>
+            <Show when=move || ui.copied.get().is_some()><p role="status">{move || ui.copied.get().unwrap_or_default()}</p></Show>
+        </section>
+    }
+}
+
 #[component]
 pub fn SendPage(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoView {
     let destination = RwSignal::new(String::new());
@@ -1360,6 +1568,10 @@ pub fn SendPage(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoV
                     </div>
                 </section>
 
+                <Show when=move || state.get().wallet.as_ref().is_some_and(|wallet| wallet.kind == WalletKind::WatchOnly)>
+                    <AirgapSendPanel transport=transport state=state destination=destination amount=amount chosen_coin=chosen_coin />
+                </Show>
+                <Show when=move || !state.get().wallet.as_ref().is_some_and(|wallet| wallet.kind == WalletKind::WatchOnly)>
                 <button
                     class="primary"
                     type="button"
@@ -1388,7 +1600,8 @@ pub fn SendPage(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoV
                 >
                     "Prepare send"
                 </button>
-                <Show when=move || state.get().spend.is_some()>
+                </Show>
+                <Show when=move || state.get().spend.as_ref().is_some_and(|plan| plan.kind != SpendKind::WatchOnlyUnsignedPsbt)>
                     <button
                         class="primary"
                         type="button"
@@ -1401,7 +1614,7 @@ pub fn SendPage(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoV
                         "Send"
                     </button>
                 </Show>
-                <Show when=move || state.get().spend.is_some()>
+                <Show when=move || state.get().spend.as_ref().is_some_and(|plan| plan.kind != SpendKind::WatchOnlyUnsignedPsbt)>
                     <article class="panel">
                         <p class="source-title">
                             {move || match state.get().spend.as_ref().map(|plan| plan.kind) {

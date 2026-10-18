@@ -13,15 +13,19 @@
 
 pub mod addon;
 pub mod airgap;
+pub mod airgap_spend;
 pub mod asert;
 pub mod bcmr;
+pub mod bcmr_author;
 pub mod cashaddr;
+pub mod coin_control;
 pub mod coins;
 pub mod conformance;
 pub mod connect;
 pub mod discovery;
 pub mod endpoint;
 pub mod error;
+pub mod explorer;
 pub mod fee;
 pub mod flipstarter;
 pub mod fundme;
@@ -31,6 +35,11 @@ pub mod header_hash;
 pub mod header_mmr;
 pub mod header_pow;
 pub mod header_time;
+/// Ledger Bitcoin Cash APDUs. Ledger ships no signer kit for this chain, so
+/// the app-binder is ours; keeping it here means every surface encodes the
+/// same bytes rather than each carrying an encoder that can disagree with the
+/// device about what an address is.
+pub mod ledger;
 pub mod multisig;
 pub mod multisig_session;
 pub mod network;
@@ -39,7 +48,9 @@ pub mod network;
 /// module that genuinely spans several NIPs and is named for the subject.
 pub mod nip44;
 pub mod nostr_identity;
+pub mod payment;
 pub mod psbt;
+pub mod release_channel;
 pub mod rpa;
 pub mod scan;
 pub mod sources;
@@ -47,9 +58,14 @@ pub mod spend;
 pub mod token;
 pub mod tor;
 pub mod tx;
+/// The animated `ur:crypto-psbt` QR an air-gapped signer scans, one encoder
+/// for every surface.
+pub mod ur;
 pub mod wallet_file;
 pub mod wallet_pack;
 pub mod watch_only;
+/// Cross-output (XO) skeleton. Not a P2PKH wrapper and not a BIP44 path.
+pub mod xo;
 
 /// The wallet's binding surface. wasm32 only, so no other target pays for it.
 #[cfg(target_arch = "wasm32")]

@@ -510,6 +510,9 @@ export const coreTranslations = {
     'send.selectCategory': 'Select category…',
     'send.balance': 'Balance',
     'send.tokenAmount': 'Token amount',
+    'send.tokenBchAmount': 'Attached BCH value',
+    'send.tokenBchMinimum':
+      'Minimum {sats} sats for the token output; network fees are selected separately.',
     'send.decimals': '{count} decimals',
     'send.integer': 'integer',
     'send.bcmrMetadata':
@@ -537,6 +540,7 @@ export const coreTranslations = {
     'send.to': 'To',
     'send.amount': 'Amount',
     'send.asset': 'Asset',
+    'send.attachedBch': 'Attached BCH',
     'send.tokenChange': 'Token change',
     'send.fee': 'Fee',
     'send.totalBch': 'Total (BCH)',
@@ -876,6 +880,10 @@ export const coreTranslations = {
     'settingsNetwork.comingSoon': 'Coming soon',
     'settingsNetwork.testnet3': 'Testnet3',
     'settingsNetwork.testnet4': 'Testnet4',
+    'settingsNetwork.testnet3Description':
+      'The long-running BCH testnet — test funds only',
+    'settingsNetwork.testnet4Description':
+      'The shorter BCH testnet — test funds only',
     'settingsNetwork.regtest': 'Regtest',
     'settingsDerivation.description':
       'OPTN supports one active BIP44 account path at a time. Reconfiguring it removes the old derived records and performs a fresh receive/change discovery and resync.',
@@ -1447,6 +1455,9 @@ export const coreTranslations = {
     'send.selectCategory': 'Selecciona una categoría…',
     'send.balance': 'Saldo',
     'send.tokenAmount': 'Importe del token',
+    'send.tokenBchAmount': 'Valor BCH adjunto',
+    'send.tokenBchMinimum':
+      'Mínimo de {sats} sats para el resultado del token; las comisiones de red se seleccionan por separado.',
     'send.decimals': '{count} decimales',
     'send.integer': 'entero',
     'send.bcmrMetadata':
@@ -1474,6 +1485,7 @@ export const coreTranslations = {
     'send.to': 'A',
     'send.amount': 'Importe',
     'send.asset': 'Activo',
+    'send.attachedBch': 'BCH adjunto',
     'send.tokenChange': 'Cambio de token',
     'send.fee': 'Comisión',
     'send.totalBch': 'Total (BCH)',
@@ -1826,6 +1838,10 @@ export const coreTranslations = {
     'settingsNetwork.comingSoon': 'Próximamente',
     'settingsNetwork.testnet3': 'Testnet3',
     'settingsNetwork.testnet4': 'Testnet4',
+    'settingsNetwork.testnet3Description':
+      'La red de pruebas BCH de larga trayectoria: solo fondos de prueba',
+    'settingsNetwork.testnet4Description':
+      'La red de pruebas BCH más corta: solo fondos de prueba',
     'settingsNetwork.regtest': 'Regtest',
     'settingsDerivation.description':
       'OPTN admite una ruta de cuenta BIP44 activa a la vez. Reconfigurarla elimina los registros derivados anteriores y realiza una nueva búsqueda y sincronización de recepción y cambio.',
@@ -2333,6 +2349,9 @@ export const coreTranslations = {
     'send.selectCategory': '选择类别…',
     'send.balance': '余额',
     'send.tokenAmount': '代币金额',
+    'send.tokenBchAmount': '附加 BCH 金额',
+    'send.tokenBchMinimum':
+      '代币输出至少需要 {sats} sats；网络费用会单独选择。',
     'send.decimals': '{count} 位小数',
     'send.integer': '整数',
     'send.bcmrMetadata': '使用所选类别的 BCMR 元数据解析。',
@@ -2356,6 +2375,7 @@ export const coreTranslations = {
     'send.to': '收款人',
     'send.amount': '金额',
     'send.asset': '资产',
+    'send.attachedBch': '附加 BCH',
     'send.tokenChange': '代币找零',
     'send.fee': '费用',
     'send.totalBch': '总计（BCH）',
@@ -2679,6 +2699,9 @@ export const coreTranslations = {
     'settingsNetwork.comingSoon': '即将推出',
     'settingsNetwork.testnet3': 'Testnet3',
     'settingsNetwork.testnet4': 'Testnet4',
+    'settingsNetwork.testnet3Description':
+      '长期运行的 BCH 测试网 — 仅限测试资金',
+    'settingsNetwork.testnet4Description': '较短的 BCH 测试网 — 仅限测试资金',
     'settingsNetwork.regtest': 'Regtest',
     'settingsDerivation.description':
       'OPTN 同时支持一条活动的 BIP44 账户路径。重新配置会移除旧的派生记录，并重新发现和同步收款/找零地址。',

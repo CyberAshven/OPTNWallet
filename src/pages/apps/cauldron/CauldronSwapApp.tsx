@@ -120,10 +120,9 @@ import {
   applySlippage,
 } from './cauldronHelpers';
 import { toTokenAwareCashAddress } from '../../../utils/cashAddress';
-import {
-  buildTxUrl,
-  DEFAULT_EXPLORER_ID,
-} from '../../../utils/servers/explorers';
+import ExplorerLink from '../../../components/ExplorerLink';
+import { networkProfile } from '../../../utils/networkProfile';
+import RemoteImg from '../../../components/RemoteImg';
 
 type CauldronSwapAppProps = {
   sdk: AddonSDK;
@@ -2959,10 +2958,7 @@ const CauldronSwapApp: React.FC<CauldronSwapAppProps> = ({ sdk, app }) => {
     : activeView === 'merchant'
       ? 'Choose what customers pay and how much to convert.'
       : 'Swap BCH and CashTokens through Cauldron.';
-  const merchantNetworkLabel =
-    currentNetwork === 'chipnet'
-      ? 'Chipnet proof of concept'
-      : 'Mainnet proof of concept';
+  const merchantNetworkLabel = `${networkProfile(currentNetwork).label} proof of concept`;
   const merchantExpiryLabel = merchantPaymentProposal
     ? new Date(merchantPaymentProposal.expiresAt).toLocaleTimeString([], {
         hour: 'numeric',
@@ -3569,7 +3565,7 @@ const CauldronSwapApp: React.FC<CauldronSwapAppProps> = ({ sdk, app }) => {
           }}
         >
           {iconUri ? (
-            <img
+            <RemoteImg
               src={iconUri}
               alt={primaryLabel}
               className="h-full w-full object-cover"
@@ -5631,18 +5627,11 @@ const CauldronSwapApp: React.FC<CauldronSwapAppProps> = ({ sdk, app }) => {
                         ) : null}
                       </div>
                       {broadcastNotice.txid ? (
-                        <a
-                          href={buildTxUrl(
-                            { kind: 'preset', id: DEFAULT_EXPLORER_ID },
-                            currentNetwork,
-                            broadcastNotice.txid
-                          )}
-                          target="_blank"
-                          rel="noreferrer"
+                        <ExplorerLink
+                          network={currentNetwork}
+                          txid={broadcastNotice.txid}
                           className="wallet-btn-secondary mt-3 block w-full px-4 py-2.5 text-center"
-                        >
-                          View on explorer ↗
-                        </a>
+                        />
                       ) : null}
                       <button
                         type="button"

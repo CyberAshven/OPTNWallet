@@ -1,11 +1,28 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+// Git for Windows supplies Bash; derive its location from the installed Git.
+const bash =
+  process.env.BASH ||
+  (process.platform === 'win32'
+    ? resolve(
+        execFileSync('git', ['--exec-path'], { encoding: 'utf8' }).trim(),
+        '../../../bin/bash.exe'
+      )
+    : 'bash');
 const workflow = readFileSync(
   resolve(repoRoot, '.github', 'workflows', 'release.yml'),
   'utf8'
@@ -79,15 +96,6 @@ describe('release workflow', () => {
       /^ {12}run_instrumentation\(\) \{[\s\S]*?^ {12}\}/m
     )?.[0];
     const method = 'useAppContext';
-    // Git for Windows supplies Bash; derive its location from the installed Git.
-    const bash =
-      process.env.BASH ||
-      (process.platform === 'win32'
-        ? resolve(
-            execFileSync('git', ['--exec-path'], { encoding: 'utf8' }).trim(),
-            '../../../bin/bash.exe'
-          )
-        : 'bash');
     // Replay the AndroidJUnitRunner transcript from CI run 34218705281,
     // with only the GitHub step/timestamp prefix removed.
     const status = (code: number, total = 1) =>
@@ -204,6 +212,64 @@ describe('release workflow', () => {
     });
   });
 
+  it('assembles signed updater artifacts for all five desktop targets', () => {
+    const assembly = workflow.match(
+      /^ {6}- name: Assemble release files\r?\n {8}run: \|\r?\n([\s\S]*?)(?=^ {6}\S)/m
+    )?.[1];
+    expect(assembly).toBeTruthy();
+    const artifacts = [
+      [
+        'desktop-windows/nsis/OPTN Wallet_1.7.4_x64-setup.exe',
+        'OPTNWallet-1.7.4-windows-x64-setup.exe',
+      ],
+      [
+        'desktop-macos-arm/macos/OPTN Wallet_1.7.4_aarch64.app.tar.gz',
+        'OPTNWallet-1.7.4-macos-arm64.app.tar.gz',
+      ],
+      [
+        'desktop-macos-intel/macos/OPTN Wallet_1.7.4_x64.app.tar.gz',
+        'OPTNWallet-1.7.4-macos-x64.app.tar.gz',
+      ],
+      [
+        'desktop-linux/appimage/OPTN Wallet_1.7.4_amd64.AppImage',
+        'OPTNWallet-1.7.4-linux-x64.AppImage',
+      ],
+      [
+        'desktop-linux-arm/appimage/OPTN Wallet_1.7.4_aarch64.AppImage',
+        'OPTNWallet-1.7.4-linux-arm64.AppImage',
+      ],
+    ].flatMap(([source, destination]) =>
+      ['', '.sig'].map((suffix) => [source + suffix, destination + suffix])
+    );
+    const directory = mkdtempSync(resolve(tmpdir(), 'optn-release-assembly-'));
+    try {
+      for (const [source, destination] of artifacts) {
+        const path = resolve(directory, 'artifacts', source);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, `fixture for ${destination}\n`);
+      }
+      const result = spawnSync(bash, ['-e', '-o', 'pipefail'], {
+        cwd: directory,
+        input: assembly!.replace(/\r\n/g, '\n').replace(/^ {10}/gm, ''),
+        encoding: 'utf8',
+        timeout: 5_000,
+        env: { ...process.env, RELEASE_TAG: 'v1.7.4' },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(readdirSync(resolve(directory, 'release-files')).sort()).toEqual(
+        artifacts.map(([, destination]) => destination).sort()
+      );
+      for (const [, destination] of artifacts) {
+        expect(
+          readFileSync(resolve(directory, 'release-files', destination), 'utf8')
+        ).toBe(`fixture for ${destination}\n`);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('pins every external action to an immutable full commit SHA', () => {
     for (const [name, contents] of [
       ['release', workflow],
@@ -232,6 +298,111 @@ describe('release workflow', () => {
     expect(desktopPreviewWorkflow).toContain(
       "--header 'Accept: application/octet-stream'"
     );
+  });
+
+  it.each([
+    [
+      'aarch64',
+      '228937549',
+      '83c292149274965a865dcd44c135cfca8ba28c6b7de3eb628d4b8b5f248af17c',
+    ],
+    [
+      'x86_64',
+      '228937581',
+      '992d502a248e14ab185448ddf6f6e7d25558cb84d4623c354c3af350c25fccb3',
+    ],
+  ])(
+    'selects the versioned AppImage plugin and digest for %s',
+    (arch, id, sha) => {
+      const pins = desktopPreviewWorkflow
+        .replace(/\r\n/g, '\n')
+        .match(/^ {10}case "\$tools_arch" in[\s\S]*?^ {10}esac/m)?.[0];
+      expect(pins).toBeTruthy();
+      const result = spawnSync(bash, ['-e', '-u', '-o', 'pipefail'], {
+        input: `${pins}\nprintf '%s %s' "$appimage_plugin_asset_id" "$appimage_plugin_sha"\n`,
+        encoding: 'utf8',
+        timeout: 5_000,
+        env: { ...process.env, tools_arch: arch },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe(`${id} ${sha}`);
+    }
+  );
+
+  it.each([
+    { name: 'verified download', cached: false, corrupt: false, exit: 0 },
+    { name: 'corrupt download', cached: false, corrupt: true, exit: 0 },
+    { name: 'failed download', cached: false, corrupt: false, exit: 22 },
+    { name: 'verified cache', cached: true, corrupt: false, exit: 0 },
+    { name: 'corrupt cache', cached: true, corrupt: true, exit: 0 },
+  ])('checks AppImage integrity before cache publication: $name', (fixture) => {
+    const download = desktopPreviewWorkflow
+      .replace(/\r\n/g, '\n')
+      .match(/^ {10}download_and_verify\(\) \{[\s\S]*?^ {10}\}/m)?.[0];
+    expect(download).toBeTruthy();
+    const directory = mkdtempSync(
+      resolve(tmpdir(), 'optn-appimage-integrity-')
+    );
+    const verified = 'verified AppImage fixture\n';
+    const corrupt = 'corrupt AppImage fixture\n';
+    const expected = createHash('sha256').update(verified).digest('hex');
+    try {
+      // A corrupt cache must be replaced by a verified download; a valid cache
+      // must avoid the network even when the remote content would be corrupt.
+      writeFileSync(
+        resolve(directory, 'download'),
+        fixture.cached || fixture.corrupt ? corrupt : verified
+      );
+      if (fixture.cached) {
+        writeFileSync(
+          resolve(directory, 'plugin'),
+          fixture.corrupt ? corrupt : verified
+        );
+        if (fixture.corrupt)
+          writeFileSync(resolve(directory, 'download'), verified);
+      }
+      const result = spawnSync(bash, ['-e', '-u', '-o', 'pipefail'], {
+        cwd: directory,
+        input: `curl() {
+  printf '%s\\n' "$@" > curl-args
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = '--output' ]; then
+      cp download "$2"
+      return "$MOCK_CURL_EXIT"
+    fi
+    shift
+  done
+  return 99
+}
+${download}
+download_and_verify https://example.invalid/plugin plugin "$EXPECTED_SHA"
+`,
+        encoding: 'utf8',
+        timeout: 5_000,
+        env: {
+          ...process.env,
+          EXPECTED_SHA: expected,
+          MOCK_CURL_EXIT: String(fixture.exit),
+        },
+      });
+      const accepted =
+        fixture.exit === 0 && (fixture.cached || !fixture.corrupt);
+      expect(result.error).toBeUndefined();
+      expect(result.status === 0, result.stdout + result.stderr).toBe(accepted);
+      expect(readdirSync(directory).includes('plugin')).toBe(accepted);
+      expect(readdirSync(directory).includes('curl-args')).toBe(
+        !fixture.cached || fixture.corrupt
+      );
+      if (accepted) {
+        expect(readFileSync(resolve(directory, 'plugin'), 'utf8')).toBe(
+          verified
+        );
+        expect(readdirSync(directory)).not.toContain('plugin.tmp');
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('builds and publishes both browser-extension archives', () => {
@@ -348,6 +519,99 @@ describe('release workflow', () => {
     expect(previewTimeout).toBeGreaterThanOrEqual(60);
   });
 
+  it('adds a locked Leptos macOS build without replacing legacy targets or Tor checks', () => {
+    const matrix =
+      desktopPreviewWorkflow.match(
+        /matrix:\s*\n([\s\S]*?)\n {4}runs-on:/
+      )?.[1] ?? '';
+    const rows = matrix.split(/- platform: /).slice(1);
+    expect(rows).toHaveLength(6);
+    for (const label of [
+      'windows-x64',
+      'macos-arm64',
+      'macos-x64',
+      'linux-x64',
+      'linux-arm64',
+    ]) {
+      const row = rows.find(
+        (value) =>
+          value.includes(`label: ${label}\n`) ||
+          value.includes(`label: ${label}\r\n`)
+      );
+      expect(row, label).toBeDefined();
+      expect(row).not.toContain('renderer: leptos');
+    }
+    const leptos = rows.find((row) =>
+      row.includes('label: macos-arm64-leptos')
+    );
+    expect(leptos).toContain('macos-latest');
+    expect(leptos).toContain('target: aarch64-apple-darwin');
+    expect(leptos).toContain(
+      'rust-targets: aarch64-apple-darwin,wasm32-unknown-unknown'
+    );
+    expect(leptos).toContain('tor-target: macos-aarch64');
+    expect(leptos).toContain('renderer: leptos');
+    expect(desktopPreviewWorkflow).toContain(
+      'targets: ${{ matrix.rust-targets || matrix.target }}'
+    );
+    expect(desktopPreviewWorkflow).toContain('toolchain: 1.98.1');
+    expect(desktopPreviewWorkflow).toContain(
+      'cargo install trunk --version 0.21.14 --locked'
+    );
+    expect(desktopPreviewWorkflow).toContain(
+      '--config src-tauri/tauri.leptos.conf.json --config "$resources_config" -- --locked'
+    );
+    expect(desktopPreviewWorkflow).toContain(
+      'codesign --force --timestamp=none --sign - "$f"'
+    );
+    expect(desktopPreviewWorkflow).toContain(
+      'bash scripts/verify-macos-bundle.sh "$APP_PATH"'
+    );
+    expect(desktopPreviewWorkflow).not.toMatch(/^\s*continue-on-error:/m);
+
+    const base = JSON.parse(
+      readFileSync(resolve(repoRoot, 'src-tauri/tauri.conf.json'), 'utf8')
+    );
+    const overlay = JSON.parse(
+      readFileSync(
+        resolve(repoRoot, 'src-tauri/tauri.leptos.conf.json'),
+        'utf8'
+      )
+    );
+    expect(base.bundle.resources).toContain('resources/tor/*');
+    // Compile-only jobs do not fetch Tor. The package build restores exactly
+    // the canonical resource list via its final Tauri config override.
+    expect(overlay.bundle.resources).toEqual([]);
+    const resourceScript = desktopPreviewWorkflow.match(
+      /resources_config="\$\(node -e '([^']+)'\)"/
+    )?.[1];
+    expect(resourceScript).toBeTruthy();
+    const packageOverlay = JSON.parse(
+      execFileSync(process.execPath, ['-e', resourceScript!], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+      })
+    );
+    expect(packageOverlay).toEqual({
+      bundle: { resources: base.bundle.resources },
+    });
+    expect(overlay.build.beforeBuildCommand).toContain(
+      'trunk build --release --locked --config Trunk.tauri.toml'
+    );
+    expect(overlay.build.frontendDist).toBe('../crates/optn-ui/dist');
+    expect(desktopPreviewWorkflow).toContain(
+      'checkout_sha="$(git rev-parse HEAD)"'
+    );
+    expect(desktopPreviewWorkflow).toContain(
+      'PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}'
+    );
+    for (const file of ['build-info.txt', 'SHA256SUMS']) {
+      expect(desktopPreviewWorkflow).toContain(
+        `src-tauri/target/\${{ matrix.target }}/debug/bundle/dmg/${file}`
+      );
+    }
+  });
+
   it('ships Linux x64 and ARM64 AppImages as the portable all-distro Linux path', () => {
     expect(workflow).toContain('target: x86_64-pc-windows-msvc');
     expect(workflow).toContain('target: x86_64-unknown-linux-gnu');
@@ -450,6 +714,7 @@ describe('release workflow', () => {
       'preview-linux-arm64-rpm',
       'preview-linux-x64-flatpak',
       'preview-linux-arm64-flatpak',
+      'preview-macos-arm64-leptos-dmg',
     ]) {
       expect(desktopPreviewWorkflow, `${artifact} must be asserted`).toContain(
         `expect ${artifact}`
@@ -477,22 +742,6 @@ describe('release workflow', () => {
     }
     // publish must wait for it, or a release is cut without the CLI.
     expect(publishNeeds(), 'publish job needs').toContain('cli');
-  });
-
-  it('assembles, checksums, and attests extensionless CLI and Flatpak assets', () => {
-    // Unix CLI binaries are extensionless and Flatpaks use .flatpak. Both
-    // still need to reach the release set, checksum file, and provenance
-    // attestation like every other published artifact.
-    const findStart = workflow.indexOf('done < <(find artifacts');
-    const findEnd = workflow.indexOf(') -print0)', findStart);
-    const assemblyFind = workflow.slice(findStart, findEnd);
-    expect(assemblyFind).toContain("-name '*.flatpak'");
-    expect(assemblyFind).toContain(
-      "-o \\( -path 'artifacts/cli-*/*' -a -name 'optn-*' \\)"
-    );
-    expect(assemblyFind).not.toContain("-o -name 'optn-*'");
-    expect(workflow).toContain('release-files/*.flatpak');
-    expect(workflow).toContain('release-files/optn-*');
   });
 
   it('arms the CLI requirement from a probe rather than from the artifacts', () => {
@@ -572,6 +821,61 @@ describe('release workflow', () => {
       expect(cliPreviewWorkflow, `${label} must be asserted`).toContain(label);
     }
     expect(cliPreviewWorkflow).toMatch(/complete:[\s\S]*?if: always\(\)/);
+  });
+
+  it('ships a CLI binary for exactly the platforms the manifest declares', () => {
+    // The lists above are written out, which is readable but means a new
+    // `when: "cli"` asset can be declared and never built: the release-time
+    // completeness gate would catch it, but only after every other platform
+    // had already compiled. Deriving the expectation from the manifest moves
+    // that failure onto the pull request, and closes the other direction too
+    // -- a matrix entry nothing publishes wastes a runner on every release.
+    const declared = (
+      JSON.parse(releaseAssets) as {
+        assets: { label: string; pattern: string; when?: string }[];
+      }
+    ).assets.filter((asset) => asset.when === 'cli');
+    expect(declared.length, 'CLI assets declared').toBeGreaterThan(0);
+
+    // `optn-${VERSION}-linux-x64` and `optn-${VERSION}-windows-x64.exe` both
+    // carry the matrix label between the version and any extension.
+    const labels = declared.map((asset) => {
+      const match = /^optn-\$\{VERSION\}-(.+?)(?:\.exe)?$/.exec(asset.pattern);
+      expect(match, `unparsable CLI pattern ${asset.pattern}`).not.toBeNull();
+      return match![1];
+    });
+
+    // The `cli` job only, not the whole file: `label:` is a matrix key other
+    // jobs use too, and a set comparison against all of them would compare the
+    // manifest to every platform the release builds.
+    const matrixLabels = (contents: string, jobId: string) => {
+      // `\r?$` throughout: these files are read from the working tree, which
+      // on Windows has CRLF, and a bare `$` would match nothing there.
+      const job = new RegExp(
+        `^ {2}${jobId}:\\r?$[\\s\\S]*?(?=^ {2}\\S)`,
+        'm'
+      ).exec(contents);
+      expect(job, `a ${jobId} job must exist`).not.toBeNull();
+      return new Set(
+        [...job![0].matchAll(/^ +label: (\S+)\r?$/gm)].map((match) => match[1])
+      );
+    };
+
+    for (const label of labels) {
+      expect(cliPreviewWorkflow, `preview builds CLI ${label}`).toContain(
+        `label: ${label}`
+      );
+    }
+    // Set equality, so both directions fail loudly: a declared asset with no
+    // builder, and a builder whose output nothing publishes.
+    expect(
+      matrixLabels(workflow, 'cli'),
+      'the release CLI matrix and the manifest must name the same platforms'
+    ).toEqual(new Set(labels));
+    expect(
+      matrixLabels(cliPreviewWorkflow, 'build'),
+      'the preview CLI matrix must match the release one'
+    ).toEqual(new Set(labels));
   });
   it('runs every asset check on pull requests to main as well', () => {
     // main is where releases are cut from. A pull request straight to it was

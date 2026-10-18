@@ -59,10 +59,73 @@ impl BroadcastState {
     }
 }
 
+/// BCHN's words for "this node already has this exact transaction".
+///
+/// From BCHN's `validation.cpp` (`AcceptToMemoryPool`, reject code
+/// `REJECT_DUPLICATE`, 0x12) and `node/transaction.cpp`
+/// (`BroadcastTransaction`, RPC -27). A node that already holds the
+/// transaction has observed it: a broadcast that meets one of these was not
+/// rejected.
+pub const ALREADY_IN_MEMPOOL: &str = "txn-already-in-mempool";
+pub const ALREADY_KNOWN: &str = "txn-already-known";
+pub const ALREADY_IN_CHAIN: &str = "transaction already in block chain";
+/// Shares `REJECT_DUPLICATE` with the two above, but means a different
+/// transaction already spends the same coins: a rejection. Matching is
+/// therefore on the exact reason, never on the code.
+pub const MEMPOOL_CONFLICT: &str = "txn-mempool-conflict";
+const REJECT_DUPLICATE: u8 = 0x12;
+
+/// What a node's answer to a broadcast says about the transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeBroadcastReply {
+    /// The node already has this exact transaction.
+    AlreadyHas,
+    /// Another transaction already spends the same coins.
+    Conflict,
+    /// Anything else, decided by the caller as before.
+    Other,
+}
+
+/// Read a P2P `reject` for this transaction (BIP61): code and bare reason.
+pub fn classify_reject(code: u8, reason: &str) -> NodeBroadcastReply {
+    match (code, reason) {
+        (REJECT_DUPLICATE, ALREADY_IN_MEMPOOL | ALREADY_KNOWN) => NodeBroadcastReply::AlreadyHas,
+        (REJECT_DUPLICATE, MEMPOOL_CONFLICT) => NodeBroadcastReply::Conflict,
+        _ => NodeBroadcastReply::Other,
+    }
+}
+
+/// Read `sendrawtransaction`'s error message, as BCHN words it: RPC -27's
+/// text, or a reject reason followed by ` (code N)` (`FormatStateMessage`).
+/// Exact matches only, so nothing that merely mentions a phrase is read as
+/// success.
+pub fn classify_node_message(message: &str) -> NodeBroadcastReply {
+    let message = message.trim();
+    if message == ALREADY_IN_CHAIN {
+        return NodeBroadcastReply::AlreadyHas;
+    }
+    let Some(reason) = message.strip_suffix(" (code 18)") else {
+        return NodeBroadcastReply::Other;
+    };
+    classify_reject(REJECT_DUPLICATE, reason)
+}
+
 #[derive(Default)]
 pub struct BroadcastCoordinator;
 
 impl BroadcastCoordinator {
+    /// Submit only while the wallet snapshot remains current. Dropping a
+    /// provider future stops pending setup; it cannot retract handed-off bytes.
+    pub async fn submit_guarded(
+        &self,
+        service: &mut ChainService,
+        raw_tx: Vec<u8>,
+        txid: Hash32,
+        guard: &crate::WalletOperationGuard,
+    ) -> BroadcastState {
+        guard_submission(guard, txid, self.submit(service, raw_tx, txid)).await
+    }
+
     pub async fn submit(
         &self,
         service: &mut ChainService,
@@ -131,6 +194,30 @@ impl BroadcastCoordinator {
     }
 }
 
+async fn guard_submission(
+    guard: &crate::WalletOperationGuard,
+    txid: Hash32,
+    submission: impl std::future::Future<Output = BroadcastState>,
+) -> BroadcastState {
+    if guard.is_revoked() {
+        return BroadcastState::Unavailable { txid };
+    }
+    let uncertain = || BroadcastState::Uncertain {
+        txid,
+        attempts: Vec::new(),
+    };
+    let outcome = tokio::select! {
+        biased;
+        _ = guard.cancelled() => return uncertain(),
+        outcome = submission => outcome,
+    };
+    if guard.is_revoked() {
+        uncertain()
+    } else {
+        outcome
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,22 +280,25 @@ mod tests {
     }
 
     fn service(backend: MockBackend) -> ChainService {
-        let id = backend.id.clone();
-        let mut catalog = SourceCatalog::default();
-        catalog
+        let mut service = ChainService::new(SourceCatalog::default(), ConnectionPolicy::auto());
+        register_backend(&mut service, backend, 0);
+        service
+    }
+
+    fn register_backend(service: &mut ChainService, backend: MockBackend, priority: u16) {
+        service
+            .catalog_mut()
             .insert(ChainSource {
-                id: id.clone(),
+                id: backend.id.clone(),
                 label: "server".into(),
                 origin: SourceOrigin::UserAdded,
                 endpoints: vec![backend.endpoint.clone()],
                 capabilities: CapabilitySet::default(),
                 disposition: SourceDisposition::Enabled,
-                priority: 0,
+                priority,
             })
             .unwrap();
-        let mut service = ChainService::new(catalog, ConnectionPolicy::auto());
         service.register(Arc::new(backend));
-        service
     }
 
     fn caps() -> CapabilitySet {
@@ -224,6 +314,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn broadcast_cancellation_stops_pending_submission_and_preserves_uncertainty() {
+        use crate::{chain::SourceId, tx_broadcast::BroadcastState, AppRuntime};
+        use optn_app::{AppAction, AppState, Network, WalletSyncView};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let preview = optn_app::seed_wallet_preview(
+            Network::Chipnet,
+            "Public cancellation fixture",
+            optn_app::BIP39_TEST_VECTOR_MNEMONIC,
+        )
+        .unwrap();
+        let mut state = AppState {
+            network: Network::Chipnet,
+            ..Default::default()
+        };
+        state.reduce(AppAction::OpenImportedWallet {
+            name: preview.name,
+            receive_address: preview.receive_address,
+            account_path: preview.account_path,
+        });
+        state.wallet_sync = WalletSyncView {
+            utxos_fresh: true,
+            history_fresh: true,
+            ..Default::default()
+        };
+        let (runtime, _driver) = AppRuntime::new(state);
+        let submitted = || BroadcastState::Submitted {
+            txid: [3; 32],
+            via: SourceId::new("fixture"),
+        };
+        let txid = [3; 32];
+        let guard = runtime.wallet_operation_guard();
+        assert!(matches!(
+            super::guard_submission(&guard, txid, async { submitted() }).await,
+            BroadcastState::Submitted { .. }
+        ));
+
+        let sent = AtomicBool::new(false);
+        let (started, connecting) = tokio::sync::oneshot::channel();
+        let (continue_setup, setup) = tokio::sync::oneshot::channel();
+        let submission = async {
+            started.send(()).unwrap();
+            setup.await.unwrap();
+            sent.store(true, Ordering::SeqCst);
+            submitted()
+        };
+        let (result, ()) = tokio::join!(super::guard_submission(&guard, txid, submission), async {
+            connecting.await.unwrap();
+            runtime.cancel_wallet_operations();
+            // Both futures are now ready: cancellation must win before
+            // provider setup can continue to the transaction write.
+            let _ = continue_setup.send(());
+        });
+        assert!(matches!(result, BroadcastState::Uncertain { txid: id, .. } if id == txid));
+        assert!(!sent.load(Ordering::SeqCst));
+        assert!(matches!(
+            super::guard_submission(&guard, txid, async {
+                panic!("a revoked guard must not poll the provider")
+            })
+            .await,
+            BroadcastState::Unavailable { .. }
+        ));
+
+        // A server may already have the bytes when cancellation arrives.
+        // Never convert that race into either success or "not sent".
+        let guard = runtime.wallet_operation_guard();
+        let error = super::guard_submission(&guard, txid, async {
+            sent.store(true, Ordering::SeqCst);
+            runtime.cancel_wallet_operations();
+            submitted()
+        })
+        .await;
+        assert!(sent.load(Ordering::SeqCst));
+        assert!(matches!(error, BroadcastState::Uncertain { txid: id, .. } if id == txid));
+    }
+
+    #[tokio::test]
     async fn timeout_is_uncertain_not_rejected() {
         let backend = MockBackend {
             id: SourceId::new("a"),
@@ -236,6 +403,77 @@ mod tests {
             .submit(&mut service(backend), vec![1], [1; 32])
             .await;
         assert!(matches!(state, BroadcastState::Uncertain { .. }));
+    }
+
+    #[tokio::test]
+    async fn ambiguous_broadcast_preserves_all_attempts_without_using_a_later_route() {
+        let txid = [1; 32];
+        for error in [
+            ChainBackendError::Timeout,
+            ChainBackendError::Offline,
+            ChainBackendError::Protocol("reply lost after submission".into()),
+            ChainBackendError::InvalidResponse("malformed reply after submission".into()),
+        ] {
+            let mut service = service(MockBackend {
+                id: SourceId::new("unsupported"),
+                endpoint: mock_endpoint(),
+                caps: caps(),
+                broadcast: Err(ChainBackendError::Unsupported),
+                lookup: Err(ChainBackendError::Offline),
+            });
+            let rejection = ChainBackendError::Rejected("policy".into());
+            for (priority, id, result) in [
+                (1, "rejected", Err(rejection.clone())),
+                (2, "uncertain", Err(error.clone())),
+                (
+                    3,
+                    "later",
+                    Ok(BackendObservation {
+                        payload: ChainPayload::BroadcastObserved { txid },
+                        evidence: Evidence::ServerAssertion,
+                        chain_tip: None,
+                    }),
+                ),
+            ] {
+                register_backend(
+                    &mut service,
+                    MockBackend {
+                        id: SourceId::new(id),
+                        endpoint: mock_endpoint(),
+                        caps: caps(),
+                        broadcast: result,
+                        lookup: Err(ChainBackendError::Offline),
+                    },
+                    priority,
+                );
+            }
+            let state = BroadcastCoordinator
+                .submit(&mut service, vec![1], txid)
+                .await;
+            assert_eq!(
+                state,
+                BroadcastState::Uncertain {
+                    txid,
+                    attempts: vec![
+                        AttemptFailure {
+                            source: SourceId::new("unsupported"),
+                            protocol: ProtocolFamily::Electrum,
+                            error: ChainBackendError::Unsupported,
+                        },
+                        AttemptFailure {
+                            source: SourceId::new("rejected"),
+                            protocol: ProtocolFamily::Electrum,
+                            error: rejection,
+                        },
+                        AttemptFailure {
+                            source: SourceId::new("uncertain"),
+                            protocol: ProtocolFamily::Electrum,
+                            error,
+                        },
+                    ],
+                }
+            );
+        }
     }
 
     #[tokio::test]
@@ -306,5 +544,70 @@ mod tests {
             .await;
         let observed = BroadcastCoordinator.observe(&mut service, submitted).await;
         assert!(matches!(observed, BroadcastState::Uncertain { .. }));
+    }
+}
+
+#[cfg(test)]
+mod node_replies {
+    use super::*;
+
+    #[test]
+    fn a_node_that_already_has_the_transaction_did_not_reject_it() {
+        for message in [
+            "transaction already in block chain",
+            "txn-already-in-mempool (code 18)",
+            "txn-already-known (code 18)",
+            "  txn-already-in-mempool (code 18)\n",
+        ] {
+            assert_eq!(
+                classify_node_message(message),
+                NodeBroadcastReply::AlreadyHas,
+                "{message:?}"
+            );
+        }
+        assert_eq!(
+            classify_reject(0x12, ALREADY_IN_MEMPOOL),
+            NodeBroadcastReply::AlreadyHas
+        );
+        assert_eq!(
+            classify_reject(0x12, ALREADY_KNOWN),
+            NodeBroadcastReply::AlreadyHas
+        );
+    }
+
+    #[test]
+    fn a_conflict_is_a_rejection_though_it_shares_the_code() {
+        assert_eq!(
+            classify_node_message("txn-mempool-conflict (code 18)"),
+            NodeBroadcastReply::Conflict
+        );
+        assert_eq!(
+            classify_reject(0x12, MEMPOOL_CONFLICT),
+            NodeBroadcastReply::Conflict
+        );
+    }
+
+    #[test]
+    fn only_exact_wording_counts() {
+        for message in [
+            "txn-already-in-mempool",
+            "txn-already-in-mempool (code 16)",
+            "txn-already-in-mempool, extra (code 18)",
+            "bad-txns-inputs-missingorspent (code 16)",
+            "missing inputs: transaction already in block chain",
+            "Missing inputs",
+            "",
+        ] {
+            assert_eq!(
+                classify_node_message(message),
+                NodeBroadcastReply::Other,
+                "{message:?}"
+            );
+        }
+        assert_eq!(
+            classify_reject(0x10, ALREADY_IN_MEMPOOL),
+            NodeBroadcastReply::Other
+        );
+        assert_eq!(classify_reject(0x12, "bad"), NodeBroadcastReply::Other);
     }
 }

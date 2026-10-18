@@ -11,6 +11,7 @@ import { SATSINBITCOIN } from '../utils/constants';
 import useSharedTokenMetadata from '../hooks/useSharedTokenMetadata';
 import { Network } from '../state/slices/networkSlice';
 import TokenIdentityBadge from '../components/ui/TokenIdentityBadge';
+import RemoteImg from '../components/RemoteImg';
 import Popup from '../components/transaction/Popup';
 import TokenQuery from '../components/TokenQuery';
 import WalletScreen from '../components/ui/WalletScreen';
@@ -33,6 +34,8 @@ import {
   resolveTokenPresentation,
 } from '../utils/tokenPresentation';
 import { useI18n } from '../i18n/useI18n';
+import { isDesktopPlatform } from '../utils/platform';
+import { isTestNetwork, networkProfile } from '../utils/networkProfile';
 
 type AssetTab = 'BCH' | 'Tokens' | 'NFTs';
 const isDev = import.meta.env.DEV;
@@ -42,6 +45,7 @@ type AssetsProps = {
 };
 
 const Assets: React.FC<AssetsProps> = ({ viewerOnly = false }) => {
+  const runtimeMetadata = isDesktopPlatform();
   const navigate = useNavigate();
   const { t } = useI18n();
   const [tab, setTab] = useState<AssetTab>('BCH');
@@ -90,21 +94,18 @@ const Assets: React.FC<AssetsProps> = ({ viewerOnly = false }) => {
   );
 
   useFetchWalletData(
-    // The shared worker publishes Redux before this route mounts. Keep the
-    // legacy query only for a cold route where no authoritative snapshot is
-    // available yet; otherwise it repeats the wallet-wide SQL/contract pass.
+    // Standard wallet UTXOs come from the shared worker. Keep the fallback
+    // only for the cold-start window so contract-held token UTXOs remain
+    // available, and defer its wallet-wide SQL pass until after navigation.
     utxoSnapshotInitialized ? null : currentWalletId,
     setWalletAddresses,
     setWalletContractAddresses,
     setWalletUtxos,
     setWalletContractUtxos,
     setDefaultChangeAddress,
-    setWalletError
+    setWalletError,
+    { deferAfterPaint: true }
   );
-
-  // The shared worker already refreshes every tracked address and publishes
-  // the authoritative Redux UTXO snapshot. The local fallback above is only
-  // for the cold-start window before that snapshot is initialized.
 
   const entries = useMemo(() => {
     const tokenTotals: Record<
@@ -141,6 +142,7 @@ const Assets: React.FC<AssetsProps> = ({ viewerOnly = false }) => {
   const tokenMetadata = useSharedTokenMetadata(tokenCategories);
   const tokenFallbackByCategory = useMemo(() => {
     const byCategory = new Map<string, TokenPresentationFallback>();
+    if (runtimeMetadata) return byCategory;
 
     for (const utxo of tokenUtxos) {
       const category = utxo.token?.category;
@@ -156,7 +158,7 @@ const Assets: React.FC<AssetsProps> = ({ viewerOnly = false }) => {
     }
 
     return byCategory;
-  }, [tokenUtxos]);
+  }, [tokenUtxos, runtimeMetadata]);
   const selectedTokenMetadata = selectedTokenCategory
     ? tokenMetadata[selectedTokenCategory]
     : null;
@@ -234,7 +236,9 @@ const Assets: React.FC<AssetsProps> = ({ viewerOnly = false }) => {
         <PageHeader
           title={t('assets.title')}
           subtitle={
-            currentNetwork === Network.CHIPNET ? t('assets.chipnet') : ''
+            isTestNetwork(currentNetwork)
+              ? t(networkProfile(currentNetwork).labelKey)
+              : ''
           }
           compact
         />
@@ -448,8 +452,8 @@ const Assets: React.FC<AssetsProps> = ({ viewerOnly = false }) => {
                           }
                         >
                           <div className="flex items-center gap-2.5">
-                            {card.imageUri ? (
-                              <img
+                            {card.imageUri && !runtimeMetadata ? (
+                              <RemoteImg
                                 src={card.imageUri}
                                 alt={card.primaryLabel}
                                 className="h-9 w-9 shrink-0 rounded-lg border border-[var(--wallet-border)] object-cover"

@@ -100,6 +100,8 @@ pub async fn start(
                 .map_err(|e| format!("could not create tor data dir: {e}"))?;
 
             let mut cmd = Command::new(&paths.binary);
+            #[cfg(windows)]
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW for the background client.
             cmd.arg("--SocksPort")
                 .arg(socks_port.to_string())
                 .arg("--DataDirectory")
@@ -177,7 +179,10 @@ pub async fn stop() -> Result<(), String> {
     BOOTSTRAP.store(0, Ordering::SeqCst);
     SOCKS_PORT.store(0, Ordering::SeqCst);
     if let Some(mut child) = CHILD.lock().await.take() {
-        let _ = child.kill().await;
+        child
+            .kill()
+            .await
+            .map_err(|error| format!("could not stop managed Tor: {error}"))?;
     }
     Ok(())
 }
@@ -190,6 +195,15 @@ pub fn status() -> TorStatus {
     }
 }
 
+/// The SOCKS port is managed only while this process's tracked child has
+/// completed its bootstrap. A listener on the integrated port is never enough:
+/// it may belong to another process.
+pub fn owned_socks_port() -> Option<u16> {
+    (RUNNING.load(Ordering::SeqCst) && SPAWNED.load(Ordering::SeqCst))
+        .then(|| SOCKS_PORT.load(Ordering::SeqCst))
+        .filter(|port| *port != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,6 +213,18 @@ mod tests {
         SPAWNED.store(false, Ordering::SeqCst);
         BOOTSTRAP.store(0, Ordering::SeqCst);
         SOCKS_PORT.store(0, Ordering::SeqCst);
+    }
+
+    /// Tor's state is process-wide and the harness runs tests in parallel, so
+    /// a test that drives it holds this turn for its whole length. Without it
+    /// one test's reset lands in the middle of another's lifecycle.
+    fn take_turn() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let turn = TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_status();
+        turn
     }
 
     #[test]
@@ -219,8 +245,11 @@ mod tests {
     }
 
     #[tokio::test]
+    // The turn is a test-only std mutex held across awaits on purpose: the
+    // state it guards is not touched by anything this test awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn occupied_managed_port_fails_closed() {
-        reset_status();
+        let _turn = take_turn();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let paths = TorPaths {
@@ -237,28 +266,35 @@ mod tests {
     }
 
     #[tokio::test]
+    // The turn is a test-only std mutex held across awaits on purpose: the
+    // state it guards is not touched by anything this test awaits.
+    #[allow(clippy::await_holding_lock)]
     async fn status_does_not_promote_an_open_socket_to_ready() {
-        reset_status();
+        let _turn = take_turn();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         SOCKS_PORT.store(listener.local_addr().unwrap().port(), Ordering::SeqCst);
         let observed = status();
         assert!(!observed.running);
         assert_eq!(observed.bootstrap_percent, 0);
+        assert_eq!(owned_socks_port(), None);
         reset_status();
     }
 
     #[test]
     fn child_log_and_exit_control_the_readiness_lifecycle() {
-        reset_status();
+        let _turn = take_turn();
         SPAWNED.store(true, Ordering::SeqCst);
 
         observe_child_log("[notice] Bootstrapped 100% (done): Done");
         assert!(status().running);
         assert_eq!(status().bootstrap_percent, 100);
+        SOCKS_PORT.store(9251, Ordering::SeqCst);
+        assert_eq!(owned_socks_port(), Some(9251));
 
         observe_child_exit();
         assert!(!status().running);
         assert_eq!(status().bootstrap_percent, 0);
         assert!(!SPAWNED.load(Ordering::SeqCst));
+        assert_eq!(owned_socks_port(), None);
     }
 }

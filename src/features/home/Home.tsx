@@ -1,10 +1,4 @@
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useDispatch, useSelector } from 'react-redux';
 import { FaArrowDown, FaArrowUp, FaBitcoin, FaQrcode } from 'react-icons/fa';
@@ -30,7 +24,6 @@ import {
 import { refreshWalletTransactionHistory } from '../../services/WalletHistoryRefreshService';
 import { refreshUTXOWorkerSubscriptions } from '../../workers/UTXOWorkerService';
 import { logError } from '../../utils/errorHandling';
-import { Network } from '../../state/slices/networkSlice';
 import { selectCurrentNetwork } from '../../state/selectors/networkSelectors';
 import { SATSINBITCOIN } from '../../utils/constants';
 import { selectRpaStealthSats } from '../../state/slices/walletSpecialActivitySlice';
@@ -46,6 +39,7 @@ import { preloadTokenMetadata } from '../../hooks/useSharedTokenMetadata';
 import { useHomeConnect } from './useHomeConnect';
 import { useI18n } from '../../i18n/useI18n';
 import { unitFor } from '../../utils/unitLabel';
+import { isTestNetwork, networkProfile } from '../../utils/networkProfile';
 
 type QuickActionButtonProps = {
   title: string;
@@ -119,7 +113,6 @@ const Home: React.FC<HomeProps> = ({ viewerOnly = false }) => {
   );
   const unit = unitFor(currentNetwork);
   const [displayMode, setDisplayMode] = useState<'BCH' | 'USD'>('BCH');
-  const autoSyncWalletRef = useRef<number | null>(null);
   const homeConnect = useHomeConnect();
   const totalBch = (totalBalance + stealthSats) / SATSINBITCOIN;
   const totalUsd =
@@ -129,6 +122,9 @@ const Home: React.FC<HomeProps> = ({ viewerOnly = false }) => {
     () => takeRecentTransactions(transactions, 3),
     [transactions]
   );
+  // Sync is explicit here. Background wallet synchronization is owned by the
+  // shared worker lifecycle so returning to Home does not start another full
+  // network, UTXO, and history pass.
   const handleRefresh = useCallback(async () => {
     if (fetchingUTXOsRedux || !currentWalletId) return;
     const walletSession = captureActiveWalletSession(currentWalletId);
@@ -233,24 +229,6 @@ const Home: React.FC<HomeProps> = ({ viewerOnly = false }) => {
     sessionGeneration,
   ]);
 
-  useEffect(() => {
-    if (viewerOnly || !currentWalletId || fetchingUTXOsRedux) return;
-    if (autoSyncWalletRef.current === currentWalletId) return;
-
-    // Let the worker lifecycle finish its current state transition first. If
-    // it is already syncing, this effect runs again when fetchingUTXOsRedux
-    // becomes false and performs a Home-owned refresh that always publishes
-    // into the visible Redux snapshot.
-    const timer = window.setTimeout(() => {
-      if (fetchingUTXOsRedux || autoSyncWalletRef.current === currentWalletId)
-        return;
-      autoSyncWalletRef.current = currentWalletId;
-      void handleRefresh();
-    }, 0);
-
-    return () => window.clearTimeout(timer);
-  }, [currentWalletId, fetchingUTXOsRedux, handleRefresh, viewerOnly]);
-
   return (
     <WalletScreen maxWidthClassName="max-w-md" scrollable={false}>
       <div className="flex h-full min-h-0 flex-col gap-4">
@@ -258,11 +236,11 @@ const Home: React.FC<HomeProps> = ({ viewerOnly = false }) => {
           title={t('home.title')}
           subtitle={
             viewerOnly
-              ? currentNetwork === Network.CHIPNET
-                ? `${t('assets.chipnet')} - Browser viewer`
+              ? isTestNetwork(currentNetwork)
+                ? `${t(networkProfile(currentNetwork).labelKey)} - Browser viewer`
                 : 'Browser viewer'
-              : currentNetwork === Network.CHIPNET
-                ? t('assets.chipnet')
+              : isTestNetwork(currentNetwork)
+                ? t(networkProfile(currentNetwork).labelKey)
                 : undefined
           }
           compact

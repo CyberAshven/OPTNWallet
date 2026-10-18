@@ -70,7 +70,10 @@ import {
   selectMintSourceUtxos,
 } from './utils/sourceHelpers';
 import { useSmoothResetTransition } from '../shared/useSmoothResetTransition';
-import { selectWalletId } from '../../../state/slices/walletSlice';
+import {
+  selectNetworkType,
+  selectWalletId,
+} from '../../../state/slices/walletSlice';
 import { useAddonI18n } from '../../../i18n/useAddonI18n';
 
 type BcmrFieldKey =
@@ -111,6 +114,7 @@ type BcmrUploadStatus = {
 };
 
 type BcmrFormFingerprint = {
+  network: string;
   authbase: string;
   tokenCategory: string;
   tokenName: string;
@@ -197,6 +201,7 @@ const MintCashTokensPoCApp: React.FC = () => {
   const location = useLocation();
   const backTarget = getReturnPath(location, '/apps');
   const walletId = useSelector(selectWalletId);
+  const network = useSelector(selectNetworkType);
 
   const [addresses, setAddresses] = useState<WalletAddressRecord[]>([]);
   const [flatUtxos, setFlatUtxos] = useState<MintAppUtxo[]>([]);
@@ -452,6 +457,7 @@ const MintCashTokensPoCApp: React.FC = () => {
   const bcmrFormFingerprint = useMemo(() => {
     const parsedDecimals = Number.parseInt(bcmrTokenDecimals, 10);
     const fingerprint: BcmrFormFingerprint = {
+      network,
       authbase: bcmrAuthbase.trim().toLowerCase(),
       tokenCategory: bcmrTokenCategory.trim().toLowerCase(),
       tokenName: bcmrTokenName.trim(),
@@ -471,6 +477,7 @@ const MintCashTokensPoCApp: React.FC = () => {
     return JSON.stringify(fingerprint);
   }, [
     bcmrAuthbase,
+    network,
     bcmrTokenCategory,
     bcmrTokenName,
     bcmrTokenDescription,
@@ -492,8 +499,7 @@ const MintCashTokensPoCApp: React.FC = () => {
 
   const bcmrUploadsComplete =
     !bcmrEnabled ||
-    (bcmrImageUploadStatus.phase === 'ready' &&
-      bcmrRegistryUploadStatus.phase === 'ready' &&
+    (bcmrRegistryUploadStatus.phase === 'ready' &&
       bcmrRegistryUpload !== null &&
       bcmrRegistryIsCurrent);
 
@@ -760,6 +766,25 @@ const MintCashTokensPoCApp: React.FC = () => {
   const resetFlowMessages = useCallback(() => {
     dispatchFlow({ type: 'reset_messages' });
   }, []);
+
+  const setBcmrPublicationEnabled = useCallback(
+    (enabled: boolean) => {
+      setBcmrEnabled(enabled);
+      if (enabled) return;
+
+      setShowBcmrPopup(false);
+      setBcmrRegistryJson('');
+      setBcmrUrisText('');
+      setBcmrImageFile(null);
+      setBcmrImageUpload(null);
+      setBcmrImageUploadStatus(IDLE_BCMR_UPLOAD_STATUS);
+      setBcmrRegistryUpload(null);
+      setBcmrRegistryUploadStatus(IDLE_BCMR_UPLOAD_STATUS);
+      setBcmrConfirmedFingerprint('');
+      clearBcmrFieldErrors();
+    },
+    [clearBcmrFieldErrors]
+  );
 
   const resetMintComposer = useCallback(() => {
     setSelectedKeys(new Set());
@@ -1326,6 +1351,7 @@ const MintCashTokensPoCApp: React.FC = () => {
     setLoading(true);
     try {
       const json = generateBcmrRegistryJson({
+        network,
         baseRegistry: await (async () => {
           try {
             const existing =
@@ -1403,6 +1429,7 @@ const MintCashTokensPoCApp: React.FC = () => {
     }
   }, [
     clearBcmrFieldErrors,
+    network,
     bcmrTokenCategory,
     bcmrTokenName,
     bcmrTokenSymbol,
@@ -1537,7 +1564,36 @@ const MintCashTokensPoCApp: React.FC = () => {
                         ? 'This mint source already has BCMR. You can mint now without publishing anything new.'
                         : 'Optional: publish BCMR metadata if you want to describe this token family before minting.'}
                     </p>
-                    <div className="flex items-center gap-2">
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        aria-pressed={!bcmrEnabled}
+                        onClick={() => setBcmrPublicationEnabled(false)}
+                        className={`px-3 py-2 text-sm font-semibold rounded-xl ${
+                          !bcmrEnabled
+                            ? 'wallet-segment-active'
+                            : 'wallet-segment-inactive'
+                        }`}
+                      >
+                        Mint without BCMR
+                      </button>
+                      <button
+                        type="button"
+                        aria-pressed={bcmrEnabled}
+                        onClick={() => {
+                          setBcmrPublicationEnabled(true);
+                          openBcmrEditor(selectedSourceHasExistingBcmr);
+                        }}
+                        className={`px-3 py-2 text-sm font-semibold rounded-xl ${
+                          bcmrEnabled
+                            ? 'wallet-segment-active'
+                            : 'wallet-segment-inactive'
+                        }`}
+                      >
+                        Publish BCMR
+                      </button>
+                    </div>
+                    {bcmrEnabled ? (
                       <button
                         type="button"
                         onClick={() => {
@@ -1551,7 +1607,7 @@ const MintCashTokensPoCApp: React.FC = () => {
                             ? addonT('common.editMetadata', 'Edit metadata')
                             : addonT('common.addMetadata', 'Add metadata')}
                       </button>
-                    </div>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
@@ -1999,9 +2055,7 @@ const MintCashTokensPoCApp: React.FC = () => {
             </div>
 
             <div className="rounded-xl wallet-surface-strong border border-[var(--wallet-border)] p-3 space-y-2">
-              <label className="block text-sm font-semibold">
-                NFT schema
-              </label>
+              <label className="block text-sm font-semibold">NFT schema</label>
               <p className="text-xs wallet-muted">
                 {outputDrafts.some((draft) => draft.config.mintType === 'NFT')
                   ? 'The NFT schema is always recorded for NFT categories, even when empty, and can be extended in later snapshots. Empty bytecode = sequential collection.'

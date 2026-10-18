@@ -1084,10 +1084,14 @@ export const localeOverrides = {
     'send.selectCategory': 'اختر فئة…',
     'send.balance': 'الرصيد',
     'send.tokenAmount': 'كمية الرمز',
+    'send.tokenBchAmount': 'قيمة BCH المرفقة',
+    'send.tokenBchMinimum':
+      'الحد الأدنى {sats} ساتوشي لمخرج الرمز؛ يتم اختيار رسوم الشبكة بشكل منفصل.',
     'send.decimals': '{count} منازل عشرية',
     'send.integer': 'عدد صحيح',
     'send.bcmrMetadata':
       'تم التحليل باستخدام بيانات BCMR الوصفية للفئة المحددة.',
+    'send.attachedBch': 'BCH مرفقة',
     'send.nfts': 'NFTs',
     'send.nftCommitment': 'التزام NFT',
     'send.optionalHexCommitment': 'التزام سداسي عشري اختياري…',
@@ -1194,6 +1198,10 @@ export const localeOverrides = {
     'settingsNetwork.comingSoon': 'قريبًا',
     'settingsNetwork.testnet3': 'Testnet3',
     'settingsNetwork.testnet4': 'Testnet4',
+    'settingsNetwork.testnet3Description':
+      'شبكة اختبار BCH طويلة الأمد — لأموال الاختبار فقط',
+    'settingsNetwork.testnet4Description':
+      'شبكة اختبار BCH الأقصر — لأموال الاختبار فقط',
     'settingsNetwork.regtest': 'Regtest',
     'settingsDerivation.description':
       'يدعم OPTN مسار حساب BIP44 نشطًا واحدًا في كل مرة. تؤدي إعادة الضبط إلى إزالة السجلات القديمة وإعادة اكتشاف عناوين الاستلام والباقي ومزامنتها.',

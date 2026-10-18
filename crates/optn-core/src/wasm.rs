@@ -22,14 +22,21 @@ use zeroize::Zeroize;
 use crate::network::Network;
 use crate::rpa;
 
+/// Shared Rust ceiling for the legacy untrusted iframe bridge.
+#[wasm_bindgen(js_name = addonLegacyGuestCallAllowed)]
+pub fn addon_legacy_guest_call_allowed(module: &str, method: &str) -> bool {
+    crate::addon::legacy_guest_call_allowed(module, method)
+}
+
+/// Deferred to `Network`'s own parser rather than a second list here.
+///
+/// Two lists drift: this one knew mainnet and chipnet only, so the wallet's
+/// web surface could not name testnet3, testnet4 or regtest even after the
+/// typed core could. `FromStr` refuses an unknown or ambiguous name, which is
+/// the behaviour this boundary wants anyway.
 fn network_from(name: &str) -> Result<Network, JsValue> {
-    match name {
-        "mainnet" => Ok(Network::Mainnet),
-        "chipnet" => Ok(Network::Chipnet),
-        other => Err(JsValue::from_str(&format!(
-            "unknown network '{other}' (expected 'mainnet' or 'chipnet')"
-        ))),
-    }
+    name.parse::<Network>()
+        .map_err(|error| JsValue::from_str(&error))
 }
 
 fn array33(bytes: &[u8], what: &str) -> Result<[u8; 33], JsValue> {
@@ -44,6 +51,592 @@ fn array32(bytes: &[u8], what: &str) -> Result<[u8; 32], JsValue> {
 
 fn err(e: crate::error::CliError) -> JsValue {
     JsValue::from_str(&e.to_string())
+}
+
+// ─── Seeds and BIP32 ─────────────────────────────────────────────────────────
+//
+// The surface of src/services/HdWalletService.ts and Bip39Service.ts, which
+// used to do this with libauth and bip39.js. The seed is computed from the
+// phrase and passphrase on every call and dropped with the call, as before;
+// only what the caller asked for leaves. Both strings arrive NFKD-normalized:
+// JS has String.normalize, and this crate builds without Unicode tables.
+
+fn hd_wallet(mnemonic: &str, passphrase: &str) -> crate::hd::Wallet {
+    crate::hd::Wallet::from_seed(&crate::hd::bip39_seed(mnemonic, passphrase))
+}
+
+/// Copy secret bytes into caller-owned JS memory, then wipe the Rust copy.
+/// The caller wipes the array it gets once it has used it.
+fn hand_over(secret: &mut [u8]) -> js_sys::Uint8Array {
+    let output = js_sys::Uint8Array::new_with_length(secret.len() as u32);
+    output.copy_from(secret);
+    secret.zeroize();
+    output
+}
+
+/// A new recovery phrase, drawn by the core from the browser's own
+/// `crypto.getRandomValues` (see `hd::generate_mnemonic`). JavaScript never
+/// supplies or sees the entropy, only the finished phrase.
+#[wasm_bindgen(js_name = bip39GenerateMnemonic)]
+pub fn bip39_generate_mnemonic(word_count: usize) -> Result<String, JsValue> {
+    let phrase = crate::hd::generate_mnemonic(word_count).map_err(err)?;
+    Ok(phrase.as_str().to_owned())
+}
+
+/// Whether a phrase is valid English BIP39, written exactly as BIP39 writes it.
+#[wasm_bindgen(js_name = bip39IsCanonicalMnemonic)]
+pub fn bip39_is_canonical_mnemonic(phrase: &str) -> bool {
+    crate::hd::is_canonical_mnemonic(phrase)
+}
+
+/// The 64-byte BIP39 seed, for keys that are not BIP32 (MLS's HPKE inputs).
+#[wasm_bindgen(js_name = bip39Seed)]
+pub fn bip39_seed(mnemonic: &str, passphrase: &str) -> js_sys::Uint8Array {
+    let mut seed = crate::hd::bip39_seed(mnemonic, passphrase);
+    hand_over(seed.as_mut())
+}
+
+/// The 32-byte private key at a path.
+#[wasm_bindgen(js_name = hdPrivateKeyAtPath)]
+pub fn hd_private_key_at_path(
+    mnemonic: &str,
+    passphrase: &str,
+    path: &str,
+) -> Result<js_sys::Uint8Array, JsValue> {
+    let mut key = hd_wallet(mnemonic, passphrase)
+        .private_key(path)
+        .map_err(err)?;
+    Ok(hand_over(key.as_mut()))
+}
+
+/// `private(32) || compressed public(33)` at a path, from one derivation.
+#[wasm_bindgen(js_name = hdKeyPairAtPath)]
+pub fn hd_key_pair_at_path(
+    mnemonic: &str,
+    passphrase: &str,
+    path: &str,
+) -> Result<js_sys::Uint8Array, JsValue> {
+    let (private_key, public_key) = hd_wallet(mnemonic, passphrase)
+        .key_pair(path)
+        .map_err(err)?;
+    let mut packed = Zeroizing::new([0u8; 65]);
+    packed[..32].copy_from_slice(private_key.as_ref());
+    packed[32..].copy_from_slice(&public_key);
+    Ok(hand_over(packed.as_mut()))
+}
+
+/// The extended public key at a path: `xpub` on mainnet, `tpub` otherwise.
+#[wasm_bindgen(js_name = hdPublicKeyAtPath)]
+pub fn hd_public_key_at_path(
+    mnemonic: &str,
+    passphrase: &str,
+    network: &str,
+    path: &str,
+) -> Result<String, JsValue> {
+    hd_wallet(mnemonic, passphrase)
+        .xpub_at(network_from(network)?, path)
+        .map_err(err)
+}
+
+/// The extended private key at a path: `xprv` on mainnet, `tprv` otherwise.
+#[wasm_bindgen(js_name = hdExtendedPrivateKeyAtPath)]
+pub fn hd_extended_private_key_at_path(
+    mnemonic: &str,
+    passphrase: &str,
+    network: &str,
+    path: &str,
+) -> Result<String, JsValue> {
+    let xprv = hd_wallet(mnemonic, passphrase)
+        .xprv_string_at(network_from(network)?, path)
+        .map_err(err)?;
+    Ok(xprv.as_str().to_owned())
+}
+
+/// The 4-byte BIP32 master fingerprint.
+#[wasm_bindgen(js_name = hdMasterFingerprint)]
+pub fn hd_master_fingerprint(mnemonic: &str, passphrase: &str) -> Result<Vec<u8>, JsValue> {
+    Ok(hd_wallet(mnemonic, passphrase)
+        .master_fingerprint()
+        .map_err(err)?
+        .to_vec())
+}
+
+/// The compressed public key at non-hardened child `index` of an xpub/tpub.
+#[wasm_bindgen(js_name = hdPublicKeyChild)]
+pub fn hd_public_key_child(hd_public_key: &str, index: u32) -> Result<Vec<u8>, JsValue> {
+    Ok(crate::hd::hd_public_key_child(hd_public_key, index)
+        .map_err(err)?
+        .to_vec())
+}
+
+/// An xpub/tpub re-serialized with `network`'s version bytes.
+#[wasm_bindgen(js_name = hdAlignPublicKeyNetwork)]
+pub fn hd_align_public_key_network(network: &str, hd_public_key: &str) -> Result<String, JsValue> {
+    crate::hd::align_hd_public_key_network(network_from(network)?, hd_public_key).map_err(err)
+}
+
+/// A public key's P2PKH and token-aware P2PKH CashAddrs, as JSON
+/// `{publicKeyHash, address, tokenAddress}` with the hash in hex.
+///
+/// Either SEC1 length is accepted, compressed or not, since both hash to a
+/// valid script; any other length is refused rather than hashed.
+#[wasm_bindgen(js_name = bchP2pkhAddresses)]
+pub fn bch_p2pkh_addresses(network: &str, public_key: &[u8]) -> Result<String, JsValue> {
+    if public_key.len() != 33 && public_key.len() != 65 {
+        return Err(JsValue::from_str(&format!(
+            "public key must be 33 or 65 bytes, got {}",
+            public_key.len()
+        )));
+    }
+    let prefix = network_from(network)?.prefix();
+    let hash = crate::hd::hash160(public_key);
+    let encode = |kind| crate::cashaddr::Address::from_hash(prefix, kind, hash).encode();
+    Ok(serde_json::json!({
+        "publicKeyHash": crate::coins::hex_encode(&hash),
+        "address": encode(crate::cashaddr::AddressKind::P2pkh),
+        "tokenAddress": encode(crate::cashaddr::AddressKind::P2pkhToken),
+    })
+    .to_string())
+}
+
+/// Pure offline review. Does not authorize a spend or establish unspentness.
+#[wasm_bindgen(js_name = psbtReviewP2pkh)]
+pub fn psbt_review_p2pkh(raw: &[u8], network: &str) -> Result<String, JsValue> {
+    let review = crate::psbt::review_p2pkh(raw, network_from(network)?).map_err(err)?;
+    serde_json::to_string(&review).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Verify the signed return against the exact reviewed bytes. Never broadcasts.
+#[wasm_bindgen(js_name = psbtFinalizeCashTokensP2pkh)]
+pub fn psbt_finalize_cash_tokens_p2pkh(
+    original: &[u8],
+    signed: &[u8],
+    network: &str,
+) -> Result<Vec<u8>, JsValue> {
+    crate::psbt::finalize_cash_tokens_p2pkh(original, signed, network_from(network)?).map_err(err)
+}
+
+/// Frames in one pass of a PSBT's animated `ur:crypto-psbt` QR.
+#[wasm_bindgen(js_name = psbtUrFrameCount)]
+pub fn psbt_ur_frame_count(psbt: &[u8], max_fragment_len: u32) -> Result<u32, JsValue> {
+    Ok(crate::ur::PsbtUr::new(psbt, max_fragment_len as usize)
+        .map_err(err)?
+        .frame_count())
+}
+
+/// Frame `seq_num` (from 1, without end) of a PSBT's animated
+/// `ur:crypto-psbt` QR. Stateless, so the screen owns only a counter and
+/// mobile and desktop draw the same frames.
+#[wasm_bindgen(js_name = psbtUrFrame)]
+pub fn psbt_ur_frame(psbt: &[u8], max_fragment_len: u32, seq_num: u32) -> Result<String, JsValue> {
+    crate::ur::PsbtUr::new(psbt, max_fragment_len as usize)
+        .and_then(|ur| ur.frame(seq_num))
+        .map_err(err)
+}
+
+/// The coin-control label of one reported coin, as JSON; see
+/// `coin_control::ReportedCoin`. Flat arguments keep a JSON parser out of
+/// this binary.
+#[wasm_bindgen(js_name = coinControlLabel)]
+pub fn coin_control_label(
+    category: Option<String>,
+    amount: Option<String>,
+    nft_capability: Option<String>,
+    identity_name: Option<String>,
+    identity_ticker: Option<String>,
+    identity_decimals: Option<u32>,
+    identity_status: Option<String>,
+) -> Result<String, JsValue> {
+    let label = crate::coin_control::ReportedCoin {
+        category,
+        amount,
+        nft_capability,
+        identity_name,
+        identity_ticker,
+        identity_decimals,
+        identity_status,
+    }
+    .label();
+    serde_json::to_string(&label).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// The label of output `vout` of the complete parent transaction `txid`
+/// (display order), as JSON. Refuses a parent that is not that transaction.
+#[wasm_bindgen(js_name = spentOutputLabel)]
+pub fn spent_output_label(parent: &[u8], txid: &str, vout: u32) -> Result<String, JsValue> {
+    let label = crate::coin_control::spent_output_label(parent, txid, vout).map_err(err)?;
+    serde_json::to_string(&label).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Sends that may spend token coins: one planner, `spend::prepare_token_spend`,
+// for every wallet kind.
+//
+// The wallet's coins cross as parallel arrays, one entry per coin, for the
+// same reason coinControlLabel takes flat arguments: no JSON parser on the
+// way in. A coin's outpoint is `txid:vout` (display order), its token fields
+// are empty strings when it carries none, and amounts are decimal strings.
+// ---------------------------------------------------------------------------
+
+fn reported_coins(
+    outpoints: &[String],
+    sats: &[u64],
+    addresses: &[String],
+    categories: &[String],
+    amounts: &[String],
+    capabilities: &[String],
+    commitments: &[String],
+) -> Result<crate::coins::CoinSet, JsValue> {
+    let count = outpoints.len();
+    if [
+        sats.len(),
+        addresses.len(),
+        categories.len(),
+        amounts.len(),
+        capabilities.len(),
+        commitments.len(),
+    ]
+    .iter()
+    .any(|len| *len != count)
+    {
+        return Err(JsValue::from_str(
+            "every coin needs one entry in each coin field",
+        ));
+    }
+    fn present(text: &str) -> Option<&str> {
+        (!text.is_empty()).then_some(text)
+    }
+    let mut coins = crate::coins::CoinSet::new();
+    for (index, outpoint) in outpoints.iter().enumerate() {
+        let refuse =
+            |error: &dyn std::fmt::Display| JsValue::from_str(&format!("coin {outpoint}: {error}"));
+        let parsed: crate::coins::Outpoint = outpoint.parse().map_err(|e| refuse(&e))?;
+        let token = match present(&categories[index]) {
+            Some(category) => Some(
+                crate::token::TokenData::from_reported(
+                    category,
+                    present(&amounts[index]),
+                    present(&capabilities[index]),
+                    present(&commitments[index]),
+                )
+                .map_err(|e| refuse(&e))?,
+            ),
+            None if [&amounts[index], &capabilities[index], &commitments[index]]
+                .iter()
+                .any(|field| !field.is_empty()) =>
+            {
+                return Err(refuse(&"token fields without a category"));
+            }
+            None => None,
+        };
+        let coin = crate::coins::Coin::from_observation(
+            parsed,
+            sats[index],
+            addresses[index].clone(),
+            token,
+        )
+        .map_err(|e| refuse(&e))?;
+        coins.insert(coin).map_err(|e| refuse(&e))?;
+    }
+    Ok(coins)
+}
+
+/// `bch` (amount in satoshis), `fungible` (target a category, amount typed
+/// with `amount_decimals`), `all_fungible` (target a category) or `nft`
+/// (target the NFT's coin).
+fn payment(
+    kind: &str,
+    target: Option<String>,
+    amount: Option<String>,
+    amount_decimals: u8,
+) -> Result<crate::spend::Payment, JsValue> {
+    use crate::spend::Payment;
+    let target = || {
+        target
+            .clone()
+            .ok_or_else(|| JsValue::from_str("this payment needs a target"))
+    };
+    let amount = || {
+        amount
+            .clone()
+            .ok_or_else(|| JsValue::from_str("this payment needs an amount"))
+    };
+    let category = |text: String| crate::token::parse_category(&text).map_err(err);
+    Ok(match kind {
+        "bch" => {
+            let text = amount()?;
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(JsValue::from_str("a BCH amount is a number of satoshis"));
+            }
+            Payment::Bch {
+                sats: text
+                    .parse()
+                    .map_err(|_| JsValue::from_str("a BCH amount is a number of satoshis"))?,
+            }
+        }
+        "fungible" => Payment::Fungible {
+            category: category(target()?)?,
+            amount: crate::coin_control::parse_scaled_amount(&amount()?, amount_decimals)
+                .map_err(err)?,
+        },
+        "all_fungible" => Payment::AllFungible {
+            category: category(target()?)?,
+        },
+        "nft" => Payment::Nft {
+            outpoint: target()?
+                .parse()
+                .map_err(|e: crate::coins::CoinError| JsValue::from_str(&e.to_string()))?,
+        },
+        other => return Err(JsValue::from_str(&format!("unknown payment '{other}'"))),
+    })
+}
+
+/// `None` lets the wallet choose; a list is coin control, and naming a coin
+/// twice is refused rather than quietly merged.
+fn coin_choice(chosen: Option<Vec<String>>) -> Result<crate::spend::CoinChoice, JsValue> {
+    let Some(chosen) = chosen else {
+        return Ok(crate::spend::CoinChoice::Automatic);
+    };
+    let mut set = std::collections::BTreeSet::new();
+    for outpoint in &chosen {
+        let parsed: crate::coins::Outpoint = outpoint
+            .parse()
+            .map_err(|e: crate::coins::CoinError| JsValue::from_str(&e.to_string()))?;
+        if !set.insert(parsed) {
+            return Err(JsValue::from_str(&format!(
+                "coin {outpoint} is chosen twice"
+            )));
+        }
+    }
+    Ok(crate::spend::CoinChoice::Exactly(set))
+}
+
+#[allow(clippy::too_many_arguments)] // A flat boundary on purpose; see above.
+fn plan(
+    network: &str,
+    outpoints: &[String],
+    sats: &[u64],
+    addresses: &[String],
+    categories: &[String],
+    amounts: &[String],
+    capabilities: &[String],
+    commitments: &[String],
+    payment_kind: &str,
+    payment_target: Option<String>,
+    payment_amount: Option<String>,
+    amount_decimals: u8,
+    chosen: Option<Vec<String>>,
+    destination: &str,
+    change: &str,
+    fee_sats_per_kb: u64,
+) -> Result<crate::spend::TokenSpendPlan, JsValue> {
+    let coins = reported_coins(
+        outpoints,
+        sats,
+        addresses,
+        categories,
+        amounts,
+        capabilities,
+        commitments,
+    )?;
+    crate::spend::prepare_token_spend(
+        &coins,
+        network_from(network)?,
+        &crate::spend::TokenSpendRequest {
+            destination: destination.to_owned(),
+            payment: payment(
+                payment_kind,
+                payment_target,
+                payment_amount,
+                amount_decimals,
+            )?,
+            coins: coin_choice(chosen)?,
+            change: change.to_owned(),
+        },
+        crate::fee::FeeRate::from_satoshis_per_kb(fee_sats_per_kb),
+    )
+    .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Plan a send that may spend token coins, as JSON; see
+/// `spend::TokenSpendPlan`. Any wallet kind can call this: it decides inputs
+/// and outputs, token and BCH change, and checks that nothing is burned.
+#[wasm_bindgen(js_name = planTokenSpend)]
+#[allow(clippy::too_many_arguments)] // A flat boundary on purpose; see above.
+pub fn plan_token_spend(
+    network: &str,
+    outpoints: Vec<String>,
+    sats: Vec<u64>,
+    addresses: Vec<String>,
+    categories: Vec<String>,
+    amounts: Vec<String>,
+    capabilities: Vec<String>,
+    commitments: Vec<String>,
+    payment_kind: &str,
+    payment_target: Option<String>,
+    payment_amount: Option<String>,
+    amount_decimals: u8,
+    chosen: Option<Vec<String>>,
+    destination: &str,
+    change: &str,
+    fee_sats_per_kb: u64,
+) -> Result<String, JsValue> {
+    let plan = plan(
+        network,
+        &outpoints,
+        &sats,
+        &addresses,
+        &categories,
+        &amounts,
+        &capabilities,
+        &commitments,
+        payment_kind,
+        payment_target,
+        payment_amount,
+        amount_decimals,
+        chosen,
+        destination,
+        change,
+        fee_sats_per_kb,
+    )?;
+    serde_json::to_string(&plan).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// The same plan as an unsigned PSBT for an air-gapped signer, as JSON
+/// `{psbt, plan, review}`: the PSBT as hex, and Rust's review of exactly
+/// those bytes for the holder to approve.
+///
+/// Takes the same arguments as `planTokenSpend` -- the plan is made again
+/// here, so the PSBT cannot be built from a different one -- then each coin's
+/// key (`pubkeys` as hex, empty when unknown, with its HD `branches` and
+/// `indexes`), the account path, the signer's fingerprint if the wallet has
+/// one, and the complete parent transaction of every input, as hex.
+#[wasm_bindgen(js_name = tokenSpendPsbt)]
+#[allow(clippy::too_many_arguments)] // A flat boundary on purpose; see above.
+pub fn token_spend_psbt(
+    network: &str,
+    outpoints: Vec<String>,
+    sats: Vec<u64>,
+    addresses: Vec<String>,
+    categories: Vec<String>,
+    amounts: Vec<String>,
+    capabilities: Vec<String>,
+    commitments: Vec<String>,
+    payment_kind: &str,
+    payment_target: Option<String>,
+    payment_amount: Option<String>,
+    amount_decimals: u8,
+    chosen: Option<Vec<String>>,
+    destination: &str,
+    change: &str,
+    fee_sats_per_kb: u64,
+    pubkeys: Vec<String>,
+    branches: Vec<u32>,
+    indexes: Vec<u32>,
+    account_path: &str,
+    fingerprint: Option<String>,
+    parents: Vec<String>,
+) -> Result<String, JsValue> {
+    let network_value = network_from(network)?;
+    let plan = plan(
+        network,
+        &outpoints,
+        &sats,
+        &addresses,
+        &categories,
+        &amounts,
+        &capabilities,
+        &commitments,
+        payment_kind,
+        payment_target,
+        payment_amount,
+        amount_decimals,
+        chosen,
+        destination,
+        change,
+        fee_sats_per_kb,
+    )?;
+    if pubkeys.len() != outpoints.len()
+        || branches.len() != outpoints.len()
+        || indexes.len() != outpoints.len()
+    {
+        return Err(JsValue::from_str(
+            "every coin needs one entry in each key field",
+        ));
+    }
+    let mut keys = std::collections::BTreeMap::new();
+    for (index, outpoint) in outpoints.iter().enumerate() {
+        if pubkeys[index].is_empty() {
+            continue;
+        }
+        let pubkey = crate::coins::hex_decode(&pubkeys[index])
+            .and_then(|bytes| <[u8; 33]>::try_from(bytes).ok())
+            .ok_or_else(|| {
+                JsValue::from_str(&format!("coin {outpoint}: a public key is 33 bytes of hex"))
+            })?;
+        let parsed: crate::coins::Outpoint = outpoint
+            .parse()
+            .map_err(|e: crate::coins::CoinError| JsValue::from_str(&e.to_string()))?;
+        keys.insert(
+            parsed,
+            crate::airgap_spend::CoinKey {
+                pubkey,
+                branch: branches[index],
+                index: indexes[index],
+            },
+        );
+    }
+    let parents = parents
+        .iter()
+        .map(|parent| {
+            crate::coins::hex_decode(parent)
+                .ok_or_else(|| JsValue::from_str("a parent transaction is hex"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared = crate::airgap_spend::prepare_token_psbt(
+        &plan,
+        &parents,
+        &keys,
+        crate::hd::parse_account_path(account_path).map_err(err)?,
+        fingerprint.as_deref(),
+        network_value,
+    )
+    .map_err(err)?;
+    serde_json::to_string(&serde_json::json!({
+        "psbt": crate::coins::hex_encode(&prepared.psbt),
+        "plan": plan,
+        "review": prepared.review,
+    }))
+    .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Inputs of a raw transaction as JSON `{txid, vout}` records. Txids use
+/// display order, matching the shared coin-hold record. This does not sign.
+#[wasm_bindgen(js_name = transactionOutpoints)]
+pub fn transaction_outpoints(raw_tx_hex: &str) -> Result<String, JsValue> {
+    if !raw_tx_hex.len().is_multiple_of(2)
+        || !raw_tx_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(JsValue::from_str("invalid transaction hex"));
+    }
+    let raw: Vec<u8> = (0..raw_tx_hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&raw_tx_hex[index..index + 2], 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| JsValue::from_str("invalid transaction hex"))?;
+    let transaction = crate::tx::decode(&raw).map_err(err)?;
+    if transaction.inputs.is_empty() {
+        return Err(JsValue::from_str("transaction has no inputs"));
+    }
+    let outpoints: Vec<_> = transaction
+        .inputs
+        .into_iter()
+        .map(|(mut txid, vout, _)| {
+            txid.reverse();
+            serde_json::json!({ "txid": crate::coins::hex_encode(&txid), "vout": vout })
+        })
+        .collect();
+    serde_json::to_string(&outpoints).map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 /// `m/44'/<coin>'/<account>'/3/0` and `/3/1`, as a JSON object.
@@ -397,13 +990,13 @@ pub fn fusion_scalar_is_canonical(bytes: &[u8]) -> bool {
 /// Add packed 32-byte non-zero canonical scalars modulo the group order.
 #[wasm_bindgen(js_name = fusionScalarSum)]
 pub fn fusion_scalar_sum(packed: &[u8]) -> Result<Vec<u8>, JsValue> {
-    if packed.is_empty() || packed.len() % 32 != 0 {
+    if packed.is_empty() || !packed.len().is_multiple_of(32) {
         return Err(JsValue::from_str(
             "packed scalars must contain one or more 32-byte values",
         ));
     }
     let mut total = k256::Scalar::ZERO;
-    for chunk in packed.chunks_exact(32) {
+    for chunk in packed.as_chunks::<32>().0 {
         total += scalar_from(chunk, "scalar")?;
     }
     Ok(total.to_bytes().to_vec())
@@ -466,11 +1059,11 @@ pub fn fusion_pedersen_balance_holds(
 ) -> Result<bool, JsValue> {
     use k256::ProjectivePoint;
 
-    if packed_commitments.is_empty() || packed_commitments.len() % 65 != 0 {
+    if packed_commitments.is_empty() || !packed_commitments.len().is_multiple_of(65) {
         return Ok(false);
     }
     let mut sum = ProjectivePoint::IDENTITY;
-    for encoded in packed_commitments.chunks_exact(65) {
+    for encoded in packed_commitments.as_chunks::<65>().0 {
         let point = match crate::fusion::schnorr::parse_point(encoded) {
             Ok(point) => point,
             Err(_) => return Ok(false),
@@ -612,4 +1205,431 @@ pub fn sign_p2pkh(context_json: &str, private_key: Vec<u8>, mode: u8) -> Result<
 #[wasm_bindgen(js_name = connectP2pkhLock)]
 pub fn p2pkh_lock(public_key: &[u8]) -> Result<Vec<u8>, String> {
     connect::p2pkh_lock(public_key)
+}
+
+// ---------------------------------------------------------------------------
+// Ledger Bitcoin Cash APDUs.
+//
+// Exposed so `src/services/hardware/ledgerBchApdu.ts` becomes a call-through
+// instead of a second encoder. Ledger ships no signer kit for this chain, so
+// the app-binder is ours -- and two copies of it are two things that can
+// disagree with the device about which address a path holds.
+// ---------------------------------------------------------------------------
+
+fn ledger_format(name: &str) -> Result<crate::ledger::AddressFormat, JsValue> {
+    use crate::ledger::AddressFormat;
+    match name {
+        "legacy" => Ok(AddressFormat::Legacy),
+        "p2sh" => Ok(AddressFormat::P2sh),
+        "bech32" => Ok(AddressFormat::Bech32),
+        "cashaddr" => Ok(AddressFormat::Cashaddr),
+        other => Err(JsValue::from_str(&format!(
+            "unknown Ledger address format '{other}'"
+        ))),
+    }
+}
+
+/// The P2 value for an address encoding. `cashaddr` is 3.
+#[wasm_bindgen(js_name = ledgerAddressFormat)]
+pub fn ledger_address_format(name: &str) -> Result<u8, JsValue> {
+    Ok(ledger_format(name)?.code())
+}
+
+/// A BIP32 path as the Bitcoin app expects it: count byte, then big-endian
+/// u32 per level with the high bit set on hardened levels.
+#[wasm_bindgen(js_name = ledgerEncodeBip32Path)]
+pub fn ledger_encode_bip32_path(path: &str) -> Result<Vec<u8>, JsValue> {
+    crate::ledger::encode_bip32_path(path).map_err(err)
+}
+
+/// GET WALLET PUBLIC KEY, as JSON so the renderer can frame it.
+///
+/// `format` defaults to cashaddr when empty: a Ledger asked for the app
+/// default returns a legacy address, which is a real address on the same
+/// chain that no modern Bitcoin Cash wallet displays.
+#[wasm_bindgen(js_name = ledgerGetWalletPublicKey)]
+pub fn ledger_get_wallet_public_key(
+    path: &str,
+    verify: bool,
+    format: &str,
+) -> Result<String, JsValue> {
+    let format = if format.is_empty() {
+        crate::ledger::AddressFormat::default()
+    } else {
+        ledger_format(format)?
+    };
+    let apdu = crate::ledger::build_get_wallet_public_key(path, verify, format).map_err(err)?;
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+    Ok(format!(
+        r#"{{"cla":{},"ins":{},"p1":{},"p2":{},"data":"{}","apdu":"{}"}}"#,
+        apdu.cla,
+        apdu.ins,
+        apdu.p1,
+        apdu.p2,
+        hex(&apdu.data),
+        hex(&apdu.to_bytes()),
+    ))
+}
+
+/// Read the device's reply. Every length is checked against what arrived, so
+/// a truncated reply is refused rather than read as a short address.
+#[wasm_bindgen(js_name = ledgerParseWalletPublicKey)]
+pub fn ledger_parse_wallet_public_key(response: &[u8]) -> Result<String, JsValue> {
+    let parsed = crate::ledger::parse_wallet_public_key(response).map_err(err)?;
+    Ok(format!(
+        r#"{{"publicKey":"{}","address":"{}","chainCode":"{}"}}"#,
+        parsed.public_key, parsed.address, parsed.chain_code,
+    ))
+}
+
+/// A status word as something the holder can act on. Empty string is success.
+#[wasm_bindgen(js_name = ledgerStatusWord)]
+pub fn ledger_status_word(status: u16) -> String {
+    crate::ledger::describe_status_word(status).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Block explorer routing (#75 row 15)
+//
+// The renderer used to hold its own copy of the presets and build these URLs
+// itself, with no notion of the connection policy -- so a holder on "own
+// infrastructure only" could open a transaction and hand its txid to a public
+// website. These entry points make the Rust the only place that decides.
+// ---------------------------------------------------------------------------
+
+fn explorer_object<'a>(
+    kind: &str,
+    value: &'a str,
+) -> Result<crate::explorer::ExplorerObject<'a>, JsValue> {
+    match kind {
+        "tx" | "txid" | "transaction" => Ok(crate::explorer::ExplorerObject::Transaction(value)),
+        "address" => Ok(crate::explorer::ExplorerObject::Address(value)),
+        "block" => Ok(crate::explorer::ExplorerObject::Block(value)),
+        other => Err(JsValue::from_str(&format!(
+            "not something an explorer can show: {other}"
+        ))),
+    }
+}
+
+fn explorer_policy(name: &str) -> crate::explorer::ExplorerPolicy {
+    crate::explorer::ExplorerPolicy::for_chain_policy(name)
+}
+
+/// Quote a string as JSON. serde_json rather than a hand-rolled escaper: the
+/// presets are all plain ASCII today, so a homemade one would look correct
+/// forever and break the first time a label carried a quote.
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+/// Every shipped preset, as JSON, so the settings picker lists exactly what
+/// the router will accept.
+#[wasm_bindgen(js_name = explorerPresets)]
+pub fn explorer_presets() -> String {
+    let entries: Vec<String> = crate::explorer::PRESETS
+        .iter()
+        .map(|entry| {
+            let mut fields = vec![
+                format!("\"id\":{}", json_string(entry.id)),
+                format!("\"label\":{}", json_string(entry.label)),
+                format!("\"tx\":{}", json_string(entry.tx)),
+                format!("\"address\":{}", json_string(entry.address)),
+            ];
+            if let Some(block) = entry.block {
+                fields.push(format!("\"block\":{}", json_string(block)));
+            }
+            if let Some(tx) = entry.chipnet_tx {
+                fields.push(format!("\"chipnetTx\":{}", json_string(tx)));
+            }
+            if let Some(address) = entry.chipnet_address {
+                fields.push(format!("\"chipnetAddress\":{}", json_string(address)));
+            }
+            format!("{{{}}}", fields.join(","))
+        })
+        .collect();
+    format!("[{}]", entries.join(","))
+}
+
+/// The preset used when the holder has not chosen one.
+#[wasm_bindgen(js_name = explorerDefaultPresetId)]
+pub fn explorer_default_preset_id() -> String {
+    crate::explorer::DEFAULT_PRESET_ID.to_string()
+}
+
+/// What a chain connection policy means for explorer links:
+/// `public-allowed`, `user-owned-only` or `disabled`.
+#[wasm_bindgen(js_name = explorerPolicyForChainPolicy)]
+pub fn explorer_policy_for_chain_policy(policy: &str) -> String {
+    match explorer_policy(policy) {
+        crate::explorer::ExplorerPolicy::PublicAllowed => "public-allowed",
+        crate::explorer::ExplorerPolicy::UserOwnedOnly => "user-owned-only",
+        crate::explorer::ExplorerPolicy::Disabled => "disabled",
+    }
+    .to_string()
+}
+
+/// A link to one of the shipped public explorers, or an error explaining why
+/// the policy refuses it.
+#[wasm_bindgen(js_name = explorerPresetUrl)]
+pub fn explorer_preset_url(
+    preset_id: &str,
+    network: &str,
+    kind: &str,
+    value: &str,
+    chain_policy: &str,
+) -> Result<String, JsValue> {
+    crate::explorer::explorer_url(
+        &crate::explorer::ExplorerChoice::Preset(preset_id.to_string()),
+        network_from(network)?,
+        explorer_object(kind, value)?,
+        explorer_policy(chain_policy),
+    )
+    .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// A link to the holder's own explorer, from the templates they supplied.
+#[wasm_bindgen(js_name = explorerCustomUrl)]
+pub fn explorer_custom_url(
+    tx_template: &str,
+    address_template: &str,
+    network: &str,
+    kind: &str,
+    value: &str,
+    chain_policy: &str,
+) -> Result<String, JsValue> {
+    crate::explorer::explorer_url(
+        &crate::explorer::ExplorerChoice::Custom {
+            tx: tx_template.to_string(),
+            address: address_template.to_string(),
+        },
+        network_from(network)?,
+        explorer_object(kind, value)?,
+        explorer_policy(chain_policy),
+    )
+    .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Choose the coins for one CashFusion round (`fusion::coin_selection`): a JSON
+/// request in, a JSON selection out, coins named by outpoint.
+///
+/// The selection's random draws come from the host's `crypto.getRandomValues`
+/// through getrandom's `js` backend, so no caller supplies them. A host
+/// without secure randomness gets an error, never a selection.
+#[wasm_bindgen(js_name = fusionSelectCoins)]
+pub fn fusion_select_coins(request_json: &str) -> Result<String, JsValue> {
+    use k256::elliptic_curve::rand_core::{OsRng, RngCore};
+    let mut unavailable = false;
+    let mut sample = || {
+        let mut bytes = [0u8; 8];
+        if OsRng.try_fill_bytes(&mut bytes).is_err() {
+            unavailable = true;
+            return 0.0;
+        }
+        (u64::from_le_bytes(bytes) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let selection =
+        crate::fusion::coin_selection::select_fusion_coins_json(request_json, &mut sample);
+    if unavailable {
+        return Err(JsValue::from_str(
+            "secure randomness is unavailable for CashFusion coin selection",
+        ));
+    }
+    selection.map_err(|error| JsValue::from_str(&error))
+}
+
+// ---------------------------------------------------------------------------
+// CashFusion depth record (`fusion::depth`), held per wallet by the renderer.
+//
+// The renderer keeps the three stored forms where it always has and carries
+// them between windows. Every rule about depth is in the crate.
+// ---------------------------------------------------------------------------
+
+/// A wallet's fusion depth record.
+#[wasm_bindgen(js_name = FusionDepthBook)]
+pub struct WasmFusionDepthBook(crate::fusion::depth::FusionDepthBook);
+
+#[wasm_bindgen(js_class = FusionDepthBook)]
+impl WasmFusionDepthBook {
+    /// Read the stored forms; a missing or unreadable part reads as empty.
+    #[wasm_bindgen(js_name = fromStored)]
+    pub fn from_stored(
+        coins: Option<String>,
+        tx_depth: Option<String>,
+        txids: Option<String>,
+    ) -> WasmFusionDepthBook {
+        Self(crate::fusion::depth::FusionDepthBook::from_stored(
+            coins.as_deref(),
+            tx_depth.as_deref(),
+            txids.as_deref(),
+        ))
+    }
+
+    #[wasm_bindgen(js_name = storedCoins)]
+    pub fn stored_coins(&self) -> String {
+        self.0.stored_coins()
+    }
+
+    #[wasm_bindgen(js_name = storedTxDepth)]
+    pub fn stored_tx_depth(&self) -> String {
+        self.0.stored_tx_depth()
+    }
+
+    #[wasm_bindgen(js_name = storedTxids)]
+    pub fn stored_txids(&self) -> String {
+        self.0.stored_txids()
+    }
+
+    /// Fold in another window's copy; the deeper entry wins.
+    #[wasm_bindgen(js_name = mergeStored)]
+    pub fn merge_stored(&mut self, coins: Option<String>, tx_depth: Option<String>) {
+        self.0.merge_stored(coins.as_deref(), tx_depth.as_deref());
+    }
+
+    /// Add fusion txids from durable storage; returns how many were new.
+    #[wasm_bindgen(js_name = addTxids)]
+    pub fn add_txids(&mut self, txids: Vec<String>) -> u32 {
+        self.0.add_txids(txids.iter().map(String::as_str)) as u32
+    }
+
+    #[wasm_bindgen(js_name = fusionTxids)]
+    pub fn fusion_txids(&self) -> Vec<String> {
+        self.0.fusion_txids().map(str::to_owned).collect()
+    }
+
+    #[wasm_bindgen(js_name = depthOf)]
+    pub fn depth_of(&self, outpoint: &str) -> u32 {
+        self.0.depth_of(outpoint)
+    }
+
+    #[wasm_bindgen(js_name = recordRound)]
+    pub fn record_round(&mut self, spent: Vec<String>, created: Vec<String>, now_ms: f64) {
+        self.0
+            .record_round(&spent, &created, now_ms.max(0.0) as u64);
+    }
+
+    #[wasm_bindgen(js_name = recordFusionTxid)]
+    pub fn record_fusion_txid(&mut self, txid: &str) -> bool {
+        self.0.record_fusion_txid(txid)
+    }
+
+    #[wasm_bindgen(js_name = pruneSpent)]
+    pub fn prune_spent(&mut self, live: Vec<String>) -> bool {
+        self.0.prune_spent(&live)
+    }
+
+    #[wasm_bindgen(js_name = isFusionTransaction)]
+    pub fn is_fusion_transaction(&self, txid: &str) -> bool {
+        self.0.is_fusion_transaction(txid)
+    }
+
+    /// Merge a cold-export record; returns `[coins taken, txids added]`.
+    #[wasm_bindgen(js_name = importState)]
+    pub fn import_state(&mut self, state: &str, now_ms: f64) -> Vec<u32> {
+        let (coins, txids) = self.0.import(state, now_ms.max(0.0) as u64);
+        vec![coins as u32, txids as u32]
+    }
+
+    /// The coins against a depth target, with Auto's two status lines, as
+    /// JSON.
+    #[wasm_bindgen(js_name = eligibility)]
+    pub fn eligibility(&self, outpoints: Vec<String>, target: u32) -> String {
+        let eligibility = self.0.eligibility(&outpoints, target);
+        serde_json::json!({
+            "total": eligibility.total,
+            "eligible": eligibility.eligible,
+            "atOrAbove": eligibility.at_or_above,
+            "target": eligibility.target,
+            "minDepth": eligibility.min_depth,
+            "maxDepth": eligibility.max_depth,
+            "metMessage": crate::fusion::depth::depth_met_message(&eligibility),
+            "gateLog": crate::fusion::depth::depth_gate_log(&eligibility),
+        })
+        .to_string()
+    }
+}
+
+/// `txid:vout` with the txid lower-cased (`fusion::depth::normalize_outpoint`).
+#[wasm_bindgen(js_name = fusionNormalizeOutpoint)]
+pub fn fusion_normalize_outpoint(outpoint: &str) -> String {
+    crate::fusion::depth::normalize_outpoint(outpoint)
+}
+
+// ---------------------------------------------------------------------------
+// BCMR authoring.
+// ---------------------------------------------------------------------------
+
+fn bcmr_author_err(e: crate::bcmr_author::AuthorError) -> JsValue {
+    JsValue::from_str(&serde_json::to_string(&e).unwrap_or_else(|_| e.message.clone()))
+}
+
+#[wasm_bindgen(js_name = bcmrAuthorRegistry)]
+pub fn bcmr_author_registry(request_json: &str) -> Result<String, JsValue> {
+    use crate::bcmr_author::{author_registry, AuthorError, AuthorRequest, ErrorField};
+    let request: AuthorRequest = serde_json::from_str(request_json).map_err(|e| {
+        bcmr_author_err(AuthorError {
+            field: ErrorField::General,
+            message: format!("Invalid registry request: {e}"),
+        })
+    })?;
+    let authored = author_registry(&request).map_err(bcmr_author_err)?;
+    serde_json::to_string(&authored).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = bcmrSuggestIdentity)]
+pub fn bcmr_suggest_identity(category: &str, has_nfts: bool) -> Result<String, JsValue> {
+    let suggested =
+        crate::bcmr_author::suggest_identity(category, has_nfts).map_err(bcmr_author_err)?;
+    serde_json::to_string(&suggested).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = bcmrSymbolError)]
+pub fn bcmr_symbol_error(symbol: &str) -> Option<String> {
+    crate::bcmr_author::validate_symbol(symbol)
+        .err()
+        .map(|e| e.message)
+}
+
+#[wasm_bindgen(js_name = bcmrSequentialCommitment)]
+pub fn bcmr_sequential_commitment(number: f64) -> Result<String, JsValue> {
+    let number = crate::bcmr_author::checked_commitment_number(number, u32::MAX, "NFT number")
+        .map_err(bcmr_author_err)?;
+    Ok(crate::bcmr_author::to_hex(
+        &crate::bcmr_author::sequential_commitment(u64::from(number)),
+    ))
+}
+
+#[wasm_bindgen(js_name = bcmrParsableCommitment)]
+pub fn bcmr_parsable_commitment(type_byte: f64, serial: f64) -> Result<String, JsValue> {
+    let type_byte =
+        crate::bcmr_author::checked_commitment_number(type_byte, u32::from(u8::MAX), "NFT type")
+            .map_err(bcmr_author_err)?;
+    let serial = crate::bcmr_author::checked_commitment_number(serial, u32::MAX, "Serial number")
+        .map_err(bcmr_author_err)?;
+    Ok(crate::bcmr_author::to_hex(
+        &crate::bcmr_author::parsable_commitment(type_byte as u8, u64::from(serial)),
+    ))
+}
+
+#[wasm_bindgen(js_name = bcmrDefaultParseBytecode)]
+pub fn bcmr_default_parse_bytecode() -> String {
+    crate::bcmr_author::DEFAULT_PARSE_BYTECODE.to_owned()
+}
+
+#[wasm_bindgen(js_name = bcmrIpfsCid)]
+pub fn bcmr_ipfs_cid(content: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest: [u8; 32] = Sha256::digest(content).into();
+    crate::bcmr_author::ipfs_raw_cid(&digest)
+}
+
+#[wasm_bindgen(js_name = bcmrReadPublication)]
+pub fn bcmr_read_publication(locking_bytecode: &[u8]) -> Option<String> {
+    let publication = crate::bcmr::parse_publication(locking_bytecode)?;
+    Some(
+        serde_json::json!({
+            "sha256": crate::bcmr_author::to_hex(&publication.content_hash),
+            "uris": publication.uris,
+        })
+        .to_string(),
+    )
 }

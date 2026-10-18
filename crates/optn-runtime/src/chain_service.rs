@@ -5,8 +5,8 @@
 
 use crate::chain::{
     build_selection_plan, Capability, CapabilityConfidence, CapabilitySet, ChainObservation,
-    ConnectionPolicy, Endpoint, Evidence, Hash32, ProtocolFamily, ProviderHealth, SourceCatalog,
-    SourceId,
+    ConnectionPolicy, Endpoint, Evidence, Hash32, ProtocolFamily, ProviderHealth, ProviderStatus,
+    SourceCatalog, SourceId,
 };
 use std::{future::Future, pin::Pin, sync::Arc};
 
@@ -58,6 +58,13 @@ impl WalletInterest {
 pub enum ChainOperation {
     WalletRefresh,
     TransactionLookup,
+    /// Determine whether a specific outpoint is currently unspent. Providers
+    /// may return `Unknown`, but this contract has no `Spent` result because a
+    /// missing UTXO does not identify a spender or prove finality.
+    OutpointSpentness,
+    /// Discover a transaction spending an exact outpoint. An absent candidate
+    /// is unknown, never evidence that the output remains unspent.
+    OutpointSpender,
     Broadcast,
     HeaderSync,
     HistoricalHeaderProof,
@@ -78,6 +85,16 @@ pub enum ChainRequest {
     TransactionLookup {
         txid: Hash32,
     },
+    OutpointSpentness {
+        txid: Hash32,
+        vout: u32,
+    },
+    OutpointSpender {
+        txid: Hash32,
+        vout: u32,
+        script_pubkey: Vec<u8>,
+        from_height: Option<u32>,
+    },
     Broadcast {
         raw_tx: Vec<u8>,
         txid: Hash32,
@@ -85,6 +102,16 @@ pub enum ChainRequest {
     HeaderSync {
         start_height: u32,
         count: u32,
+    },
+    /// Fetch headers after an explicitly supplied locator.
+    ///
+    /// Historical recovery uses a private staged store. The locator is typed
+    /// into the request so a provider can acquire the next batch without
+    /// observing or being given write access to the shared accepted store.
+    HeaderSyncFromLocator {
+        start_height: u32,
+        count: u32,
+        locator: Hash32,
     },
     HistoricalHeaderProof {
         height: u32,
@@ -98,8 +125,12 @@ impl ChainRequest {
             Self::CashcodeBlockRange { .. } => ChainOperation::WalletRefresh,
             Self::WalletRefresh { .. } => ChainOperation::WalletRefresh,
             Self::TransactionLookup { .. } => ChainOperation::TransactionLookup,
+            Self::OutpointSpentness { .. } => ChainOperation::OutpointSpentness,
+            Self::OutpointSpender { .. } => ChainOperation::OutpointSpender,
             Self::Broadcast { .. } => ChainOperation::Broadcast,
-            Self::HeaderSync { .. } => ChainOperation::HeaderSync,
+            Self::HeaderSync { .. } | Self::HeaderSyncFromLocator { .. } => {
+                ChainOperation::HeaderSync
+            }
             Self::HistoricalHeaderProof { .. } => ChainOperation::HistoricalHeaderProof,
         }
     }
@@ -118,6 +149,28 @@ pub struct ObservedTransaction {
     pub block_height: Option<u32>,
 }
 
+/// Source observation for one requested outpoint.
+///
+/// `Unknown` is intentionally the only result for an absent UTXO. It must
+/// never be promoted to a spender assertion or proof that the output is spent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutpointSpentness {
+    Unspent {
+        txid: Hash32,
+        vout: u32,
+        value_sats: u64,
+        script_pubkey: Vec<u8>,
+        /// BCHN's `gettxout.bestblock`: the UTXO-set block at which this
+        /// particular assertion was evaluated. It is an anchor hash, not a
+        /// height claim.
+        best_block: Hash32,
+    },
+    Unknown {
+        txid: Hash32,
+        vout: u32,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainPayload {
     WalletRefresh {
@@ -125,6 +178,18 @@ pub enum ChainPayload {
         tip: Option<ChainTip>,
     },
     Transaction(ObservedTransaction),
+    OutpointSpentness(OutpointSpentness),
+    OutpointSpender {
+        txid: Hash32,
+        vout: u32,
+        spender: Option<ObservedTransaction>,
+        /// Transactions the search passed through on its way to `spender`,
+        /// nearest first: each spends an output of the one before it, the first
+        /// spends an output of `spender`. Discovery hints only. A consumer that
+        /// follows an authchain through them must still check every link, and a
+        /// source owes nothing here: an empty list is always a valid answer.
+        descendants: Vec<ObservedTransaction>,
+    },
     BroadcastObserved {
         txid: Hash32,
     },
@@ -140,6 +205,10 @@ pub enum ChainPayload {
         root: Hash32,
     },
 }
+
+/// Upper bound on [`ChainPayload::OutpointSpender::descendants`]. A provider's
+/// hints are untrusted, so their volume is bounded where they enter.
+pub const MAX_SPENDER_DESCENDANTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendObservation {
@@ -166,6 +235,18 @@ pub struct CapabilityRoute {
     pub capability: Capability,
     pub confidence: CapabilityConfidence,
     pub health: ProviderHealth,
+}
+
+/// A capability claim held by a registered backend. Unlike a route, this does
+/// not imply that the current policy permits use or that the backend is healthy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredCapabilityObservation {
+    pub source: SourceId,
+    pub protocol: ProtocolFamily,
+    pub endpoint: Option<Endpoint>,
+    pub capability: Capability,
+    pub confidence: CapabilityConfidence,
+    pub discovery: crate::chain::CapabilityDiscovery,
 }
 
 pub trait ChainBackend: Send + Sync {
@@ -233,6 +314,25 @@ pub struct ProviderRegistry {
 impl ProviderRegistry {
     pub fn register(&mut self, provider: Arc<dyn ChainBackend>) {
         self.providers.push(provider);
+    }
+
+    fn registered_capability_observations(&self) -> Vec<RegisteredCapabilityObservation> {
+        self.providers
+            .iter()
+            .flat_map(|provider| {
+                provider
+                    .capabilities()
+                    .iter()
+                    .map(move |(capability, claim)| RegisteredCapabilityObservation {
+                        source: provider.source_id().clone(),
+                        protocol: provider.protocol(),
+                        endpoint: provider.endpoint().cloned(),
+                        capability,
+                        confidence: claim.confidence,
+                        discovery: claim.discovery.clone(),
+                    })
+            })
+            .collect()
     }
 
     fn provider_routes<'a>(
@@ -345,6 +445,7 @@ pub struct ChainService {
     catalog: SourceCatalog,
     policy: ConnectionPolicy,
     registry: ProviderRegistry,
+    registry_fetcher: Option<Arc<dyn crate::token_metadata::RegistryFetcher>>,
     health_overrides: Vec<HealthOverride>,
 }
 
@@ -366,7 +467,7 @@ impl ChainRevocation {
     pub fn is_revoked(&self) -> bool {
         *self.0.borrow()
     }
-    async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) {
         let mut state = self.0.subscribe();
         while !*state.borrow_and_update() {
             if state.changed().await.is_err() {
@@ -383,6 +484,7 @@ impl ChainService {
             catalog,
             policy,
             registry: ProviderRegistry::default(),
+            registry_fetcher: None,
             health_overrides: Vec::new(),
         }
     }
@@ -399,10 +501,79 @@ impl ChainService {
         &self.policy
     }
     pub fn set_policy(&mut self, policy: ConnectionPolicy) {
+        if self.policy != policy {
+            // This transport was installed under the old host privacy policy.
+            // A new selection must explicitly reauthorize it.
+            self.registry_fetcher = None;
+        }
         self.policy = policy;
     }
     pub fn register(&mut self, provider: Arc<dyn ChainBackend>) {
         self.registry.register(provider);
+    }
+    /// Snapshot registered backend claims without dialing, policy filtering, or
+    /// health filtering. A revoked stack exposes no observations.
+    pub fn registered_capability_observations(&self) -> Vec<RegisteredCapabilityObservation> {
+        if self.revocation.is_revoked() {
+            Vec::new()
+        } else {
+            self.registry.registered_capability_observations()
+        }
+    }
+    /// Install the host-owned bounded registry byte fetcher for this selected
+    /// chain stack. Hash and authchain decisions stay with the runtime.
+    pub fn set_registry_fetcher(
+        &mut self,
+        fetcher: Arc<dyn crate::token_metadata::RegistryFetcher>,
+    ) {
+        self.registry_fetcher = Some(fetcher);
+    }
+    /// The optional host fetcher is shared by GUI and CLI through this source
+    /// stack; callers still bind work to their own source lifetime.
+    pub fn registry_fetcher(&self) -> Option<Arc<dyn crate::token_metadata::RegistryFetcher>> {
+        if self.revocation.is_revoked() {
+            None
+        } else {
+            self.registry_fetcher.clone()
+        }
+    }
+
+    /// Each registered provider once per source and protocol, with the
+    /// health this service gives it. A route this stack marked down wins over
+    /// what the backend says of itself, and the best endpoint stands for the
+    /// pair. A revoked stack lists none.
+    pub fn provider_statuses(&self) -> Vec<ProviderStatus> {
+        if self.revocation.is_revoked() {
+            return Vec::new();
+        }
+        let mut statuses = std::collections::BTreeMap::new();
+        for provider in &self.registry.providers {
+            let health = self
+                .health_overrides
+                .iter()
+                .find(|entry| {
+                    entry.source == *provider.source_id()
+                        && entry.protocol == provider.protocol()
+                        && entry.endpoint.as_ref() == provider.endpoint()
+                })
+                .map_or_else(|| provider.health(), |entry| entry.health);
+            statuses
+                .entry((provider.source_id().clone(), provider.protocol()))
+                .and_modify(|best: &mut ProviderHealth| {
+                    if health_rank(health) < health_rank(*best) {
+                        *best = health;
+                    }
+                })
+                .or_insert(health);
+        }
+        statuses
+            .into_iter()
+            .map(|((source, protocol), health)| ProviderStatus {
+                source,
+                protocol,
+                health,
+            })
+            .collect()
     }
 
     pub fn clear_health_override(&mut self, source: &SourceId, protocol: ProtocolFamily) {
@@ -496,10 +667,53 @@ impl ChainService {
             .collect()
     }
 
+    /// Resolve another operation on the same selected provider route.
+    ///
+    /// The returned route is reconstructed from the current catalog and policy
+    /// for `operation`; an earlier route snapshot grants no authority after a
+    /// source, endpoint, protocol, or privacy-policy change.
+    pub fn matching_route_for_operation(
+        &self,
+        selected: &CapabilityRoute,
+        operation: ChainOperation,
+    ) -> Option<CapabilityRoute> {
+        self.routes_for_operation(operation)
+            .into_iter()
+            .find(|candidate| {
+                candidate.source == selected.source
+                    && candidate.protocol == selected.protocol
+                    && candidate.endpoint == selected.endpoint
+            })
+    }
+
     pub async fn execute_on_route(
         &mut self,
         route: &CapabilityRoute,
         request: &ChainRequest,
+    ) -> Result<ChainObservation<ChainPayload>, ChainServiceError> {
+        self.execute_on_route_with(route, request, true).await
+    }
+
+    /// [`Self::execute_on_route`] for optional work, such as token metadata,
+    /// whose outcome must not change which routes wallet synchronization uses.
+    ///
+    /// The same policy check and response binding apply. Only the route-health
+    /// bookkeeping is skipped: an identity lookup a server cannot answer leaves
+    /// that server exactly as eligible for the next refresh as it was, and an
+    /// answer cannot clear a failure the refresh itself recorded.
+    pub async fn execute_optional_on_route(
+        &mut self,
+        route: &CapabilityRoute,
+        request: &ChainRequest,
+    ) -> Result<ChainObservation<ChainPayload>, ChainServiceError> {
+        self.execute_on_route_with(route, request, false).await
+    }
+
+    async fn execute_on_route_with(
+        &mut self,
+        route: &CapabilityRoute,
+        request: &ChainRequest,
+        record_health: bool,
     ) -> Result<ChainObservation<ChainPayload>, ChainServiceError> {
         // Routes are public snapshots, not authorization to bypass current policy.
         if !self
@@ -537,11 +751,60 @@ impl ChainService {
                     )),
                 }
             }
+            if let ChainRequest::OutpointSpentness { txid, vout } = request {
+                match &observation.payload {
+                    ChainPayload::OutpointSpentness(
+                        OutpointSpentness::Unspent {
+                            txid: observed_txid,
+                            vout: observed_vout,
+                            ..
+                        }
+                        | OutpointSpentness::Unknown {
+                            txid: observed_txid,
+                            vout: observed_vout,
+                        },
+                    ) if observed_txid == txid && observed_vout == vout => {}
+                    _ => return Err(ChainBackendError::InvalidResponse(
+                        "outpoint spentness response does not bind to the requested outpoint".into(),
+                    )),
+                }
+            }
+            if let ChainRequest::OutpointSpender { txid, vout, .. } = request {
+                match &observation.payload {
+                    ChainPayload::OutpointSpender {
+                        txid: observed_txid,
+                        vout: observed_vout,
+                        spender,
+                        descendants,
+                    } if observed_txid == txid && observed_vout == vout
+                        && spender.as_ref().is_none_or(|transaction| {
+                            optn_core::header_hash::sha256d(&transaction.raw) == transaction.txid
+                                && optn_core::tx::decode(&transaction.raw).is_ok_and(|decoded| {
+                                    decoded.inputs.iter().any(|(parent, index, _)| {
+                                        parent == txid && index == vout
+                                    })
+                                })
+                        })
+                        // Hints still have to be the bytes they claim to be, and
+                        // only exist alongside the spender they lead back to.
+                        && (spender.is_some() || descendants.is_empty())
+                        && descendants.len() <= MAX_SPENDER_DESCENDANTS
+                        && descendants.iter().all(|transaction| {
+                            optn_core::header_hash::sha256d(&transaction.raw) == transaction.txid
+                                && optn_core::tx::decode(&transaction.raw).is_ok()
+                        }) => {}
+                    _ => return Err(ChainBackendError::InvalidResponse(
+                        "spender response does not bind to the requested outpoint".into(),
+                    )),
+                }
+            }
             Ok(observation)
         });
         match response {
             Ok(observation) => {
-                self.set_route_health(route, ProviderHealth::Healthy);
+                if record_health {
+                    self.set_route_health(route, ProviderHealth::Healthy);
+                }
                 Ok(ChainObservation {
                     value: observation.payload,
                     source: route.source.clone(),
@@ -550,7 +813,19 @@ impl ChainService {
                 })
             }
             Err(error) => {
-                self.set_route_health(route, health_for_error(&error));
+                // SHV advertisement is not proof of service (bit 9 has also
+                // been used by non-SHV nodes). An optional proof timeout or
+                // refusal must not disable the same peer's ordinary header
+                // path. Invalid replies still quarantine the route.
+                if record_health
+                    && (!matches!(request, ChainRequest::HistoricalHeaderProof { .. })
+                        || !matches!(
+                            error,
+                            ChainBackendError::Unsupported | ChainBackendError::Timeout
+                        ))
+                {
+                    self.set_route_health(route, health_for_error(&error));
+                }
                 Err(ChainServiceError::Exhausted {
                     attempts: vec![AttemptFailure {
                         source: route.source.clone(),
@@ -576,7 +851,22 @@ impl ChainService {
                 Ok(value) => return Ok(value),
                 Err(ChainServiceError::Exhausted {
                     attempts: mut failed,
-                }) => attempts.append(&mut failed),
+                }) => {
+                    // A failed reply can follow a successful broadcast handoff.
+                    // Only unsupported operations (no I/O) and deterministic
+                    // rejections permit another route to submit the same bytes.
+                    let uncertain_broadcast = matches!(request, ChainRequest::Broadcast { .. })
+                        && failed.iter().any(|attempt| {
+                            !matches!(
+                                attempt.error,
+                                ChainBackendError::Unsupported | ChainBackendError::Rejected(_)
+                            )
+                        });
+                    attempts.append(&mut failed);
+                    if uncertain_broadcast {
+                        return Err(ChainServiceError::Exhausted { attempts });
+                    }
+                }
                 Err(
                     ChainServiceError::NoEligibleProvider | ChainServiceError::RouteUnavailable,
                 ) => {}
@@ -617,6 +907,8 @@ pub const fn operation_capability(operation: ChainOperation) -> Capability {
     match operation {
         ChainOperation::WalletRefresh => Capability::UtxoQuery,
         ChainOperation::TransactionLookup => Capability::TransactionQuery,
+        ChainOperation::OutpointSpentness => Capability::OutpointUnspentLookup,
+        ChainOperation::OutpointSpender => Capability::OutpointSpenderLookup,
         ChainOperation::Broadcast => Capability::Broadcast,
         ChainOperation::HeaderSync => Capability::HeaderStream,
         ChainOperation::HistoricalHeaderProof => Capability::HeaderMerkleProof,
@@ -640,6 +932,9 @@ mod tests {
         offline: AtomicBool,
         hold: AtomicBool,
         entered: tokio::sync::Notify,
+        spentness: OutpointSpentness,
+        spender_response: std::sync::Mutex<ChainPayload>,
+        failure: std::sync::Mutex<Option<ChainBackendError>>,
     }
 
     impl ChainBackend for CountingBackend {
@@ -665,21 +960,44 @@ mod tests {
         fn supports(&self, operation: ChainOperation) -> bool {
             matches!(
                 operation,
-                ChainOperation::HeaderSync | ChainOperation::Broadcast
+                ChainOperation::HeaderSync
+                    | ChainOperation::Broadcast
+                    | ChainOperation::WalletRefresh
+                    | ChainOperation::OutpointSpentness
+                    | ChainOperation::OutpointSpender
             )
         }
-        fn execute<'a>(&'a self, _: &'a ChainRequest) -> ChainFuture<'a, BackendObservation> {
+        fn execute<'a>(&'a self, request: &'a ChainRequest) -> ChainFuture<'a, BackendObservation> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if self.hold.load(Ordering::SeqCst) {
                     self.entered.notify_one();
                     std::future::pending::<()>().await;
                 }
-                Ok(BackendObservation {
-                    payload: ChainPayload::Headers {
+                if let Some(error) = self.failure.lock().unwrap().clone() {
+                    return Err(error);
+                }
+                let payload = match request {
+                    ChainRequest::Broadcast { txid, .. } => {
+                        ChainPayload::BroadcastObserved { txid: *txid }
+                    }
+                    ChainRequest::WalletRefresh { .. } => ChainPayload::WalletRefresh {
+                        transactions: vec![],
+                        tip: None,
+                    },
+                    ChainRequest::OutpointSpender { .. } => {
+                        self.spender_response.lock().unwrap().clone()
+                    }
+                    ChainRequest::OutpointSpentness { .. } => {
+                        ChainPayload::OutpointSpentness(self.spentness.clone())
+                    }
+                    _ => ChainPayload::Headers {
                         start_height: 1,
                         headers: vec![],
                     },
+                };
+                Ok(BackendObservation {
+                    payload,
                     evidence: Evidence::ServerAssertion,
                     chain_tip: None,
                 })
@@ -687,8 +1005,13 @@ mod tests {
         }
     }
 
-    fn routed_service() -> (ChainService, Arc<CountingBackend>, CapabilityRoute) {
+    fn counting_backend(source: &str) -> Arc<CountingBackend> {
         let mut capabilities = CapabilitySet::default();
+        capabilities.record(
+            Capability::ElectrumProtocol,
+            CapabilityConfidence::Advertised,
+            CapabilityDiscovery::ElectrumServerFeatures,
+        );
         capabilities.record(
             Capability::HeaderStream,
             CapabilityConfidence::Verified,
@@ -699,11 +1022,26 @@ mod tests {
             CapabilityConfidence::Verified,
             CapabilityDiscovery::ActiveProbe,
         );
-        let backend = Arc::new(CountingBackend {
-            source: SourceId::new("server"),
+        capabilities.record(
+            Capability::UtxoQuery,
+            CapabilityConfidence::Verified,
+            CapabilityDiscovery::ActiveProbe,
+        );
+        capabilities.record(
+            Capability::OutpointUnspentLookup,
+            CapabilityConfidence::Verified,
+            CapabilityDiscovery::ActiveProbe,
+        );
+        capabilities.record(
+            Capability::OutpointSpenderLookup,
+            CapabilityConfidence::Advertised,
+            CapabilityDiscovery::ElectrumServerVersion,
+        );
+        Arc::new(CountingBackend {
+            source: SourceId::new(source),
             endpoint: Endpoint {
                 kind: EndpointKind::ElectrumTcp,
-                host: "server.invalid".into(),
+                host: format!("{source}.invalid"),
                 port: Some(50001),
             },
             capabilities,
@@ -711,7 +1049,22 @@ mod tests {
             offline: AtomicBool::new(false),
             hold: AtomicBool::new(false),
             entered: tokio::sync::Notify::new(),
-        });
+            spentness: OutpointSpentness::Unknown {
+                txid: [1; 32],
+                vout: 0,
+            },
+            spender_response: std::sync::Mutex::new(ChainPayload::OutpointSpender {
+                txid: [1; 32],
+                vout: 0,
+                spender: None,
+                descendants: Vec::new(),
+            }),
+            failure: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn routed_service() -> (ChainService, Arc<CountingBackend>, CapabilityRoute) {
+        let backend = counting_backend("server");
         let mut catalog = SourceCatalog::default();
         catalog
             .insert(ChainSource {
@@ -732,10 +1085,279 @@ mod tests {
         (service, backend, route)
     }
 
+    fn service_with_fallback(
+        failure: ChainBackendError,
+    ) -> (ChainService, Arc<CountingBackend>, Arc<CountingBackend>) {
+        let (mut service, primary, _) = routed_service();
+        *primary.failure.lock().unwrap() = Some(failure);
+        let fallback = counting_backend("fallback");
+        service
+            .catalog_mut()
+            .insert(ChainSource {
+                id: fallback.source.clone(),
+                label: "fallback".into(),
+                origin: SourceOrigin::UserAdded,
+                endpoints: vec![fallback.endpoint.clone()],
+                capabilities: CapabilitySet::default(),
+                disposition: SourceDisposition::Enabled,
+                priority: 1,
+            })
+            .unwrap();
+        service.register(fallback.clone());
+        (service, primary, fallback)
+    }
+
+    #[tokio::test]
+    async fn broadcast_stops_failover_after_an_ambiguous_attempt() {
+        for error in [
+            ChainBackendError::Timeout,
+            ChainBackendError::Offline,
+            ChainBackendError::Protocol("reply lost".into()),
+            ChainBackendError::InvalidResponse("malformed reply".into()),
+        ] {
+            let (mut service, primary, fallback) = service_with_fallback(error.clone());
+            let request = ChainRequest::Broadcast {
+                raw_tx: vec![1],
+                txid: [1; 32],
+            };
+            assert_eq!(
+                service.execute(&request).await,
+                Err(ChainServiceError::Exhausted {
+                    attempts: vec![AttemptFailure {
+                        source: primary.source.clone(),
+                        protocol: ProtocolFamily::Electrum,
+                        error,
+                    }],
+                })
+            );
+            assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn broadcast_can_fall_back_after_unsupported_or_deterministic_rejection() {
+        for error in [
+            ChainBackendError::Unsupported,
+            ChainBackendError::Rejected("policy".into()),
+        ] {
+            let (mut service, primary, fallback) = service_with_fallback(error);
+            let request = ChainRequest::Broadcast {
+                raw_tx: vec![1],
+                txid: [1; 32],
+            };
+            let observation = service.execute(&request).await.unwrap();
+            assert_eq!(observation.source, fallback.source);
+            assert_eq!(
+                observation.value,
+                ChainPayload::BroadcastObserved { txid: [1; 32] }
+            );
+            assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fallback.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_refresh_keeps_failover_after_ambiguous_errors() {
+        for error in [
+            ChainBackendError::Timeout,
+            ChainBackendError::Offline,
+            ChainBackendError::Protocol("reply lost".into()),
+            ChainBackendError::InvalidResponse("malformed reply".into()),
+        ] {
+            let (mut service, primary, fallback) = service_with_fallback(error);
+            let request = ChainRequest::WalletRefresh {
+                interests: vec![WalletInterest::script([0x51])],
+                from_height: None,
+            };
+            let observation = service.execute(&request).await.unwrap();
+            assert_eq!(observation.source, fallback.source);
+            assert_eq!(
+                observation.value,
+                ChainPayload::WalletRefresh {
+                    transactions: vec![],
+                    tip: None,
+                }
+            );
+            assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fallback.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn registered_capabilities_keep_confidence_and_clear_after_revocation() {
+        let (service, backend, _) = routed_service();
+        let observations = service.registered_capability_observations();
+        assert!(observations.iter().any(|observation| {
+            observation.capability == Capability::ElectrumProtocol
+                && observation.confidence == CapabilityConfidence::Advertised
+        }));
+        assert!(observations.iter().any(|observation| {
+            observation.capability == Capability::HeaderStream
+                && observation.confidence == CapabilityConfidence::Verified
+        }));
+        service.revocation().revoke();
+        assert!(service.registered_capability_observations().is_empty());
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            0,
+            "reading evidence must not contact a provider"
+        );
+    }
+
     const HEADER_REQUEST: ChainRequest = ChainRequest::HeaderSync {
         start_height: 1,
         count: 1,
     };
+
+    #[tokio::test]
+    async fn outpoint_spentness_payload_must_bind_to_the_requested_outpoint() {
+        let (mut service, backend, _) = routed_service();
+        let request = ChainRequest::OutpointSpentness {
+            txid: [2; 32],
+            vout: 3,
+        };
+        assert!(matches!(
+            service.execute(&request).await,
+            Err(ChainServiceError::Exhausted { attempts })
+                if matches!(attempts.as_slice(), [AttemptFailure {
+                    error: ChainBackendError::InvalidResponse(_),
+                    ..
+                }])
+        ));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn optional_work_never_changes_which_routes_wallet_sync_may_use() {
+        // The fixture answers this with a payload for another outpoint: an
+        // invalid response, which quarantines a route on the wallet's own path.
+        let request = ChainRequest::OutpointSpentness {
+            txid: [2; 32],
+            vout: 3,
+        };
+        let (mut service, backend, _) = routed_service();
+        let route = service
+            .routes_for_operation(ChainOperation::OutpointSpentness)
+            .remove(0);
+        assert!(service
+            .execute_optional_on_route(&route, &request)
+            .await
+            .is_err());
+        assert!(
+            !service
+                .routes_for_operation(ChainOperation::HeaderSync)
+                .is_empty(),
+            "a failed metadata lookup must leave the route eligible for sync"
+        );
+        assert!(service.execute_on_route(&route, &request).await.is_err());
+        assert!(service
+            .routes_for_operation(ChainOperation::HeaderSync)
+            .is_empty());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn spender_discovery_checks_raw_hash_exact_input_and_current_policy() {
+        let request = ChainRequest::OutpointSpender {
+            txid: [1; 32],
+            vout: 0,
+            script_pubkey: vec![0x51],
+            from_height: None,
+        };
+        let mut raw = vec![2, 0, 0, 0, 1];
+        raw.extend([1; 32]);
+        raw.extend(0u32.to_le_bytes());
+        raw.extend([0, 255, 255, 255, 255, 1]);
+        raw.extend(546u64.to_le_bytes());
+        raw.extend([1, 0x51, 0, 0, 0, 0]);
+        let transaction = ObservedTransaction {
+            txid: optn_core::header_hash::sha256d(&raw),
+            raw,
+            block_height: None,
+        };
+        for case in 0..5 {
+            let (mut service, backend, _) = routed_service();
+            let mut candidate = transaction.clone();
+            match case {
+                2 => candidate.txid = [9; 32],
+                3 => {
+                    candidate.raw[5] = 2;
+                    candidate.txid = optn_core::header_hash::sha256d(&candidate.raw);
+                }
+                _ => {}
+            }
+            *backend.spender_response.lock().unwrap() = ChainPayload::OutpointSpender {
+                txid: if case == 4 { [2; 32] } else { [1; 32] },
+                vout: 0,
+                spender: (case != 0).then_some(candidate),
+                descendants: Vec::new(),
+            };
+            let result = service.execute(&request).await;
+            assert_eq!(result.is_ok(), case < 2, "case {case}: {result:?}");
+        }
+        for policy in [
+            ConnectionPolicy::own_infrastructure(),
+            ConnectionPolicy::exact(SourceId::new("other"), ProtocolFamily::Electrum),
+            ConnectionPolicy::exact(SourceId::new("server"), ProtocolFamily::Bip37),
+        ] {
+            let (mut service, backend, _) = routed_service();
+            let route = service
+                .routes_for_operation(ChainOperation::OutpointSpender)
+                .remove(0);
+            service.set_policy(policy);
+            assert_eq!(
+                service.execute_on_route(&route, &request).await,
+                Err(ChainServiceError::RouteUnavailable)
+            );
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn matching_route_rederives_the_follow_on_operation_on_the_same_provider() {
+        let (service, _, header_route) = routed_service();
+        let spentness_route = service
+            .routes_for_operation(ChainOperation::OutpointSpentness)
+            .remove(0);
+        let follow_on = service
+            .matching_route_for_operation(&spentness_route, ChainOperation::HeaderSync)
+            .expect("the same selected provider supports headers");
+        assert_eq!(follow_on.source, spentness_route.source);
+        assert_eq!(follow_on.protocol, spentness_route.protocol);
+        assert_eq!(follow_on.endpoint, spentness_route.endpoint);
+        assert_eq!(follow_on.capability, header_route.capability);
+    }
+
+    /// The status lists each provider once, with the health this service
+    /// gives it: an override from this stack's life wins over the backend's
+    /// own report. A revoked stack lists none.
+    #[test]
+    fn provider_statuses_follow_route_health() {
+        let (mut service, backend, route) = routed_service();
+        let health = |service: &ChainService| {
+            service
+                .provider_statuses()
+                .into_iter()
+                .map(|status| (status.source, status.protocol, status.health))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            health(&service),
+            vec![(
+                route.source.clone(),
+                ProtocolFamily::Electrum,
+                ProviderHealth::Healthy
+            )]
+        );
+        service.set_route_health(&route, ProviderHealth::Degraded);
+        assert_eq!(health(&service)[0].2, ProviderHealth::Degraded);
+        service.clear_health_override(&route.source, route.protocol);
+        backend.offline.store(true, Ordering::SeqCst);
+        assert_eq!(health(&service)[0].2, ProviderHealth::Offline);
+        service.revocation().revoke();
+        assert!(health(&service).is_empty());
+    }
 
     #[tokio::test]
     async fn refresh_retry_recovers_offline_routes_without_clearing_quarantine_or_revocation() {

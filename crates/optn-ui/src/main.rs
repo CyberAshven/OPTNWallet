@@ -11,6 +11,8 @@ use leptos::reactive::owner::LocalStorage;
 #[cfg(target_arch = "wasm32")]
 mod airgap;
 #[cfg(target_arch = "wasm32")]
+mod chain_sources;
+#[cfg(target_arch = "wasm32")]
 mod derivation;
 #[cfg(target_arch = "wasm32")]
 mod hardware;
@@ -20,6 +22,7 @@ mod multisig;
 mod scan;
 #[cfg(target_arch = "wasm32")]
 mod settings;
+mod stylesheet;
 #[cfg(target_arch = "wasm32")]
 mod tools;
 
@@ -33,10 +36,10 @@ use hardware::HardwareSection;
 use multisig::MultisigSection;
 #[cfg(target_arch = "wasm32")]
 use optn_app::{
-    create_confirm_indices, entropy_len_for_word_count, mnemonic_from_entropy, onboarding_actions,
-    onboarding_view_model, seed_wallet_preview_at, watch_only_setup_preview, AppAction, AppRoute,
-    AppState, AppSurface, AuthScope, CreateStep, ImportStep, Network, OnboardingAction, ThemeMode,
-    WatchOnlyKind, WatchOnlySetupPreview, BIP39_DEFAULT_WORD_COUNT, BIP39_WORD_COUNTS,
+    create_confirm_indices, onboarding_actions, onboarding_view_model, seed_wallet_preview_at,
+    watch_only_setup_preview, AppAction, AppRoute, AppState, AppSurface, AuthScope, CreateStep,
+    ImportStep, Network, OnboardingAction, ThemeMode, WatchOnlyKind, WatchOnlySetupPreview,
+    BIP39_DEFAULT_WORD_COUNT, BIP39_WORD_COUNTS,
 };
 #[cfg(target_arch = "wasm32")]
 use optn_transport::AppTransport;
@@ -230,9 +233,13 @@ fn WatchOnlySetup(transport: UiTransport, state: RwSignal<AppState>) -> impl Int
                             {move || match state.get().network {
                                 Network::Mainnet => "Expected account path: m/44'/145'/account'",
                                 // Grouped exactly as Network::default_coin_type
-                                // groups them: regtest shares testnet's SLIP-44
-                                // coin type, so the two hints cannot drift apart.
-                                Network::Chipnet | Network::Regtest => {
+                                // groups them: every test chain shares
+                                // testnet's SLIP-44 coin type, so the two hints
+                                // cannot drift apart.
+                                Network::Testnet3
+                                | Network::Testnet4
+                                | Network::Chipnet
+                                | Network::Regtest => {
                                     "Expected account path: m/44'/1'/account'"
                                 }
                             }}
@@ -351,21 +358,7 @@ fn WatchOnlySetup(transport: UiTransport, state: RwSignal<AppState>) -> impl Int
                             </div>
                         </dl>
 
-                        <button
-                            class="primary"
-                            type="button"
-                            on:click=move |_| {
-                                if let Some(preview) = preview.get_untracked() {
-                                    dispatch_action(
-                                        transport,
-                                        state,
-                                        AppAction::OpenWatchOnlyWallet(preview),
-                                    );
-                                }
-                            }
-                        >
-                            "Open watch-only wallet"
-                        </button>
+                        <security::SaveWatchOnly transport=transport state=state preview=preview error=error />
                     </section>
                 </Show>
             </section>
@@ -465,23 +458,13 @@ fn Landing(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoView {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn fill_entropy(len: usize) -> Result<Vec<u8>, String> {
-    let crypto = web_sys::window()
-        .ok_or_else(|| "browser window is unavailable".to_string())?
-        .crypto()
-        .map_err(|_| "Web Crypto is unavailable".to_string())?;
-    let mut entropy = vec![0u8; len];
-    crypto
-        .get_random_values_with_u8_array(entropy.as_mut_slice())
-        .map_err(|_| "could not gather entropy".to_string())?;
-    Ok(entropy)
-}
-
-#[cfg(target_arch = "wasm32")]
 #[component]
 fn CreateWallet(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoView {
     let name = RwSignal::new(String::from("My wallet"));
     let phrase = RwSignal::new(String::new());
+    // The runtime draws the phrase and keeps it; this screen only shows it,
+    // and Create names the draft instead of sending the words back.
+    let draft = RwSignal::new(None::<String>);
     let error = RwSignal::new(None::<String>);
     let password = RwSignal::new(String::new());
     let confirmation = RwSignal::new(String::new());
@@ -495,17 +478,29 @@ fn CreateWallet(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoV
 
     Effect::new(move |_| {
         let words = word_count.get();
-        match entropy_len_for_word_count(words)
-            .map_err(|error| error.to_string())
-            .and_then(fill_entropy)
-            .and_then(|entropy| mnemonic_from_entropy(&entropy).map_err(|error| error.to_string()))
-        {
-            Ok(next) => {
-                error.set(None);
-                phrase.set(next);
+        let runtime = transport.get_value();
+        leptos::task::spawn_local(async move {
+            match runtime.seed_draft(words).await {
+                Ok(next) => {
+                    error.set(None);
+                    draft.set(Some(next.draft));
+                    phrase.set(next.phrase.expose().to_owned());
+                }
+                Err(optn_transport::TransportError::Other(message)) => error.set(Some(message)),
+                Err(_) => error.set(Some(
+                    "A new recovery phrase is unavailable on this interface.".into(),
+                )),
             }
-            Err(message) => error.set(Some(message)),
-        }
+        });
+    });
+    // Leaving the screen forgets an unused phrase.
+    on_cleanup(move || {
+        let runtime = transport.get_value();
+        leptos::task::spawn_local(async move {
+            let _ = runtime
+                .wallet_security(optn_transport::WalletSecurityRequest::DiscardSeedDraft)
+                .await;
+        });
     });
 
     view! {
@@ -686,11 +681,12 @@ fn CreateWallet(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoV
                                 Ok(opened) => {
                                     let request = optn_transport::WalletSecurityRequest::Create {
                                         name: opened.name,
-                                        mnemonic: optn_app::SecretText::new(phrase.get_untracked()),
+                                        mnemonic: optn_app::SecretText::default(),
                                         bip39_passphrase: optn_app::SecretText::default(),
                                         password: optn_app::SecretText::new(password.get_untracked()),
                                         confirmation: optn_app::SecretText::new(confirmation.get_untracked()),
                                         network: state.get_untracked().network.to_string(), account_path: opened.account_path,
+                                        draft: draft.get_untracked(),
                                     };
                                     password.set(String::new()); confirmation.set(String::new());
                                     security::submit(transport, state, request, security_status, error, security_busy);
@@ -848,6 +844,7 @@ fn ImportWallet(transport: UiTransport, state: RwSignal<AppState>) -> impl IntoV
                                         password: optn_app::SecretText::new(password.get_untracked()),
                                         confirmation: optn_app::SecretText::new(confirmation.get_untracked()),
                                         network: state.get_untracked().network.to_string(), account_path: opened.account_path,
+                                        draft: None,
                                     };
                                     password.set(String::new()); confirmation.set(String::new());
                                     security::submit(transport, state, request, security_status, error, security_busy);

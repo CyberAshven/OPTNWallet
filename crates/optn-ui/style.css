@@ -10,6 +10,8 @@
   --border: rgba(17, 24, 39, 0.12);
   --accent: #19b773;
   --accent-text: #051b12;
+  --danger: #b42318;
+  --warning: #8a5300;
 }
 
 * {
@@ -47,6 +49,8 @@ a {
   --border: rgba(17, 24, 39, 0.12);
   --accent: #19b773;
   --accent-text: #051b12;
+  --danger: #b42318;
+  --warning: #8a5300;
 }
 
 .app-shell.theme-gray {
@@ -57,6 +61,8 @@ a {
   --border: rgba(255, 255, 255, 0.1);
   --accent: #3dd68c;
   --accent-text: #052014;
+  --danger: #ff9a8f;
+  --warning: #f2c46b;
 }
 
 .app-shell.theme-green,
@@ -68,6 +74,8 @@ a {
   --border: rgba(61, 214, 140, 0.22);
   --accent: #3dd68c;
   --accent-text: #042016;
+  --danger: #ffa198;
+  --warning: #ffd27a;
 }
 
 .app-shell.theme-dark {
@@ -78,6 +86,8 @@ a {
   --border: rgba(255, 255, 255, 0.12);
   --accent: #31db90;
   --accent-text: #03150d;
+  --danger: #ff8f86;
+  --warning: #f2cc60;
 }
 
 .app-shell.skin-cyberpunk {
@@ -110,6 +120,14 @@ a {
   padding: 0.72rem 1.1rem;
   text-decoration: none;
   cursor: pointer;
+  /* 44px is the smallest comfortable touch target every mobile HIG states.
+     Declared rather than left to padding: 0.72rem plus a line box lands near
+     42px, and "nearly" is the kind of thing nobody revisits. Stated here so
+     stylesheet.rs can check it. */
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .chip,
@@ -331,6 +349,7 @@ h1 {
 }
 
 .field input,
+.field select,
 .field textarea {
   width: 100%;
   border: 1px solid var(--border);
@@ -349,6 +368,7 @@ h1 {
 }
 
 .field input:focus,
+.field select:focus,
 .field textarea:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
@@ -608,6 +628,16 @@ h1 {
   gap: 0.75rem;
 }
 
+.error,
+.field-error {
+  color: var(--danger);
+}
+
+.warn,
+.warning {
+  color: var(--warning);
+}
+
 .notice {
   display: flex;
   justify-content: space-between;
@@ -762,6 +792,7 @@ h1 {
 .settings-row {
   display: grid;
   gap: 0.45rem;
+  min-height: 44px;
 }
 
 .tab-item.active {
@@ -1483,3 +1514,23 @@ h1 {
 .wallet-chrome.shell-mobile .quick-tile small {
   font-size: 0.64rem;
 }
+
+/* Shared source controls keep touch targets usable on desktop and mobile. */
+.field select { min-height: 44px; }
+.field:has(input[type="checkbox"]) { display: flex; align-items: center; min-height: 44px; }
+.field input[type="checkbox"] { width: 1.25rem; height: 1.25rem; padding: 0; }
+
+/* Source summaries stay compact; details work by keyboard and touch. */
+.source-badges { display: flex; flex-wrap: wrap; gap: .5rem; }
+.source-badges details { max-width: 100%; }
+.source-badges summary { cursor: pointer; min-height: 44px; }
+.source-badges p { overflow-wrap: anywhere; }
+/* Narrow desktop windows use bottom navigation without changing host capabilities. */
+@media (max-width: 720px) {
+  .wallet-chrome.shell-desktop { width: calc(100% - 2rem); padding-bottom: calc(6rem + env(safe-area-inset-bottom)); }
+  .wallet-chrome.shell-desktop .chrome-body { display: block; }
+  .wallet-chrome.shell-desktop .tab-rail { display: none; }
+  .wallet-chrome.shell-desktop .tab-bar { display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; background: var(--surface); padding-bottom: env(safe-area-inset-bottom); }
+}
+button.settings-row { color: var(--text); text-align: left; }
+[aria-label="Chain sources"] { min-width: 0; overflow-wrap: anywhere; }

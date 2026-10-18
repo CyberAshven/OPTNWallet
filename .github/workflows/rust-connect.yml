@@ -2,9 +2,9 @@ name: Shared Rust connectors
 
 on:
   pull_request:
-    branches: [dev, staging, main]
+    branches: [dev, staging, main, agent/rpa-shared-vectors]
   push:
-    branches: [main]
+    branches: [dev, staging, main]
   workflow_dispatch:
 
 permissions:
@@ -25,11 +25,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: '20'
+          node-version: '22.23.2'
           cache: npm
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
-          toolchain: '1.94.0'
+          toolchain: '1.98.1'
           targets: wasm32-unknown-unknown
           components: clippy, rustfmt
       - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
@@ -46,6 +46,8 @@ jobs:
           cargo test --locked
       - name: Check committed WASM against the connector and BCH VM tests
         run: npx --no-install vitest run src/services/connect/__tests__/ConnectSigningCore.test.ts src/services/wizardconnect/__tests__/signing.test.ts src/services/cashconnect/__tests__/cashconnectLibauth.test.ts src/redux/walletconnect/__tests__/signing.rust.test.ts
+      - name: Verify CashTokens PSBTs with the independent BCH VM
+        run: npx --no-install vitest run src/services/psbt/__tests__/cashTokensRust.test.ts
       - name: Install matching binding generator
         run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
       - name: Rebuild WASM from Rust
@@ -54,3 +56,4 @@ jobs:
         run: |
           npx --no-install tsx scripts/build-optn-core-wasm.mts --check
           npx --no-install vitest run src/services/connect/__tests__/ConnectSigningCore.test.ts src/services/wizardconnect/__tests__/signing.test.ts src/services/cashconnect/__tests__/cashconnectLibauth.test.ts src/redux/walletconnect/__tests__/signing.rust.test.ts
+          npx --no-install vitest run src/services/psbt/__tests__/cashTokensRust.test.ts

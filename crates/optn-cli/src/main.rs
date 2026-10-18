@@ -12,6 +12,7 @@
 mod console;
 mod contract;
 mod electrum;
+mod fusion;
 mod keychain;
 mod lmots;
 mod msgsign;
@@ -22,6 +23,7 @@ mod token;
 mod tx;
 mod wallet_security;
 mod x402;
+mod x402_exact;
 
 // These modules live in optn-core so the wallet can reach the same code
 // through wasm32. Re-exported under their old paths so every `crate::rpa::...`
@@ -32,10 +34,8 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use bip39::{Language, Mnemonic};
-use optn_chain_native::{build_native_chain_stack, NativeChainSecrets};
 use optn_multisig_core::{inspect_p2sh20, Network as MultisigNetwork};
-use optn_runtime::chain::{build_selection_plan, ProtocolFamily};
+use optn_runtime::chain::{build_selection_plan, EndpointKind, ProtocolFamily};
 use optn_runtime::chain_service::{ChainOperation, ChainPayload, ChainRequest};
 use optn_runtime::tx_broadcast::{BroadcastCoordinator, BroadcastState};
 
@@ -94,7 +94,7 @@ struct Cli {
     profile: String,
 
     /// Seconds to wait before giving up. Defaults to 300 for rescan, history,
-    /// and wallet; 30 otherwise.
+    /// tokens, wallet and RPA discovery/sweep; 30 otherwise. HD commands use one total budget.
     #[arg(long, global = true)]
     timeout: Option<u64>,
 
@@ -137,6 +137,12 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    /// Review a local hex PSBT; optionally verify a signed return. Offline, Chipnet only.
+    Psbt {
+        original: PathBuf,
+        #[arg(long, value_name = "SIGNED_HEX_FILE")]
+        signed: Option<PathBuf>,
+    },
     /// Broadcast a signed, hex-encoded transaction.
     Broadcast { hex: String },
     /// Generate a new BIP39 recovery phrase.
@@ -170,6 +176,7 @@ enum Command {
     },
     /// CashToken balances held by the wallet.
     Tokens {
+        /// Consecutive unused addresses required after history on each HD branch.
         #[arg(long, default_value_t = 20)]
         gap: u32,
     },
@@ -242,10 +249,60 @@ enum Command {
         /// Addresses per chain to scan for spendable outputs.
         #[arg(long, default_value_t = 20)]
         gap: u32,
+        /// Saved wallets: fail a scan that reaches this bound before its
+        /// unused gap (as for rescan).
+        #[arg(long, default_value_t = 200)]
+        max_addresses: u32,
         /// Build and sign, print the raw transaction, but do not broadcast.
         #[arg(long)]
         dry_run: bool,
         /// Required to actually broadcast.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Fuse this wallet's coins in CashFusion rounds, through a server
+    /// (Electron Cash protocol) or peer to peer over Nostr (--p2p), in the same
+    /// native fusion host as the desktop.
+    ///
+    /// Needs a saved wallet (--wallet) and --yes: every round pays fees. Tor is
+    /// required for any remote leg. Without --auto, runs one round (or
+    /// --rounds). With --auto, keeps fusing until every coin reaches
+    /// --fuse-depth, then idles and watches the wallet. Progress goes to
+    /// stderr as JSON lines; the result is on stdout.
+    Fusion {
+        /// CashFusion server: host[:port][:s|:t]. A local server defaults to
+        /// plain TCP, a remote one to TLS; port 8789 if omitted. Required
+        /// unless --p2p.
+        #[arg(long, required_unless_present = "p2p", conflicts_with = "p2p")]
+        server: Option<String>,
+        /// Fuse with other wallets peer to peer, coordinated over Nostr,
+        /// instead of through a server. Needs at least six wallets in the pool.
+        #[arg(long)]
+        p2p: bool,
+        /// Nostr relay for P2P rounds (repeatable): wss, or plain ws for a
+        /// loopback relay. The desktop's relay set if omitted.
+        #[arg(long = "relay", requires = "p2p")]
+        relays: Vec<String>,
+        /// Keep fusing like the desktop's Auto Fusion.
+        #[arg(long)]
+        auto: bool,
+        /// Stop after this many completed rounds.
+        #[arg(long)]
+        rounds: Option<u32>,
+        /// Rounds each coin goes through before Auto leaves it alone.
+        #[arg(long, default_value_t = 3)]
+        fuse_depth: u32,
+        /// Register only this tier, in satoshis (repeatable), so wallets that
+        /// must meet do. Server rounds only: a P2P pool agrees its own tier.
+        #[arg(long = "tier", conflicts_with = "p2p")]
+        tiers: Vec<u64>,
+        /// Addresses per chain to scan before each round.
+        #[arg(long, default_value_t = 20)]
+        gap: u32,
+        /// Fail a scan that reaches this bound before its unused gap.
+        #[arg(long, default_value_t = 200)]
+        max_addresses: u32,
+        /// Required: rounds pay fees.
         #[arg(long)]
         yes: bool,
     },
@@ -255,6 +312,9 @@ enum Command {
     /// retain the same checkpoint as the GUI; restored data remains stale
     /// until a complete live refresh succeeds.
     Rescan {
+        /// Inclusive rescan floor; zero requests full history. Persists for saved wallets.
+        #[arg(long)]
+        from_height: Option<u32>,
         /// Consecutive unused addresses required on each HD branch.
         #[arg(long, default_value_t = 20)]
         gap: u32,
@@ -389,6 +449,32 @@ enum Command {
 
 #[derive(Subcommand)]
 enum NetworkCommand {
+    /// Export a non-secret, network-bound backup as JSON on stdout.
+    Export,
+    /// Restore this network from a portable JSON backup.
+    Import { file: std::path::PathBuf },
+    /// Apply a complete primary/fallback/protocol selection from a JSON file.
+    Configure { file: std::path::PathBuf },
+    /// Choose auto, privacy, own-infrastructure, electrum-only, bip37-only or neutrino-only.
+    Policy { preset: String },
+    /// Turn Tor on or off. Off connects directly and CashFusion does not run.
+    Tor {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
+    /// Trust the SOCKS proxy on 127.0.0.1:PORT as your Tor, as the desktop's
+    /// Privacy & Transport does. --remove stops trusting it.
+    TorTrust {
+        port: u16,
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Add one source using an AddSourceRequest JSON file.
+    Add { file: std::path::PathBuf },
+    /// Enable, disable, or ban a source known to this network catalog.
+    Disposition { source: String, disposition: String },
+    /// Delete a user-added source and its machine-local RPC credential, if any.
+    Remove { source: String },
     /// Show sources, policy, and the primary/fallback selection order.
     Status,
     /// Select an existing shared source without a public fallback.
@@ -408,7 +494,8 @@ enum NetworkCommand {
     },
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, clap::ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 enum ChainProtocol {
     Electrum,
     Bip37,
@@ -603,8 +690,17 @@ enum KeychainCommand {
 
 #[derive(Subcommand)]
 enum X402Command {
+    /// Inspect an x402 v2 exact quote using the BCH SDK.
+    Check(x402_exact::Request),
+    /// Inspect the durable local payment record without contacting its server.
+    Status {
+        #[arg(long)]
+        payment_id: String,
+    },
+    /// Pay an exact quote from a saved wallet, retaining its transaction for recovery.
+    Pay(x402_exact::Pay),
     /// Ask what a resource costs. Reads only; never spends.
-    Check {
+    LegacyCheck {
         url: String,
         /// Extra request header, as `Name: value`. Repeatable.
         #[arg(long = "header", short = 'H')]
@@ -620,7 +716,7 @@ enum X402Command {
     /// Without --fund this debits an existing funding output and spends
     /// nothing on-chain, which is the normal case once a server is funded.
     /// --fund broadcasts a funding transaction first and needs --yes.
-    Pay {
+    LegacyPay {
         url: String,
         /// Fund the server with this many satoshis before authorising.
         ///
@@ -699,7 +795,7 @@ async fn main() {
             Err(err) => emit_cli_error(&cli, *stdio, err),
         }
     }
-    match run(&cli).await {
+    match dispatch(&cli).await {
         Ok(value) => {
             if cli.json {
                 println!(
@@ -720,7 +816,24 @@ async fn main() {
 /// The command as it appears in the skill manifest.
 fn command_name(command: &Command) -> &'static str {
     match command {
+        Command::Psbt { .. } => "psbt",
         Command::Wallet { .. } => "wallet",
+        Command::Network {
+            action: NetworkCommand::Export,
+        } => "network export",
+        Command::Network {
+            action: NetworkCommand::Import { .. },
+        } => "network import",
+        Command::Network {
+            action:
+                NetworkCommand::Configure { .. }
+                | NetworkCommand::Policy { .. }
+                | NetworkCommand::Tor { .. }
+                | NetworkCommand::TorTrust { .. }
+                | NetworkCommand::Add { .. }
+                | NetworkCommand::Disposition { .. }
+                | NetworkCommand::Remove { .. },
+        } => "network configure",
         Command::Ping => "ping",
         Command::Network {
             action: NetworkCommand::Select { .. },
@@ -742,6 +855,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::TokenSend { .. } => "token-send",
         Command::Send { .. } => "send",
         Command::Rescan { .. } => "rescan",
+        Command::Fusion { .. } => "fusion",
         Command::History { .. } => "history",
         Command::Discover { .. } => "discover",
         Command::Contract { .. } => "contract",
@@ -756,7 +870,15 @@ fn command_name(command: &Command) -> &'static str {
     }
 }
 
-fn client_for(cli: &Cli) -> Result<Client> {
+/// How long one candidate server gets to answer `server.version` before the
+/// next is tried.
+const CANDIDATE_PROBE_SECS: u64 = 20;
+
+async fn client_for(cli: &Cli) -> Result<Client> {
+    // Read once, applied to whichever endpoint is chosen below: which proxy
+    // the holder trusts does not depend on which server they are talking to.
+    let trusted =
+        network_settings::trusted_socks_ports(cli.network, cli.network_config_dir.as_deref());
     if cli.host.is_some() || cli.port.is_some() || cli.no_tls {
         return Client::new(
             cli.host
@@ -765,26 +887,58 @@ fn client_for(cli: &Cli) -> Result<Client> {
             cli.port.unwrap_or_else(|| cli.network.default_port()),
             !cli.no_tls,
             timeout_seconds(cli),
-        );
+        )
+        .map(|client| client.trusting_socks_ports(trusted));
     }
 
-    let endpoint =
-        network_settings::shared_electrum(cli.network, cli.network_config_dir.as_deref())
+    let build = |host: String, port: u16, tls: bool| {
+        Client::new(host, port, tls, timeout_seconds(cli)).map(|client| {
+            // The holder's Tor switch and own-node declaration, from the same
+            // shared settings the desktop uses. Unreadable settings keep Tor on.
+            let (transport, own) = network_settings::transport_for_host(
+                cli.network,
+                cli.network_config_dir.as_deref(),
+                client.host(),
+            );
+            client
+                .trusting_socks_ports(trusted.clone())
+                .following(transport, own)
+        })
+    };
+    let servers =
+        network_settings::shared_electrum_servers(cli.network, cli.network_config_dir.as_deref())
             .map_err(CliError::Usage)?;
-    match endpoint {
-        Some(endpoint) => Client::new(
-            endpoint.host().to_owned(),
-            endpoint.port(),
-            endpoint.encrypted(),
-            timeout_seconds(cli),
-        ),
-        None => Client::new(
+    let Some(servers) = servers else {
+        return build(
             cli.network.default_host().to_owned(),
             cli.network.default_port(),
             true,
-            timeout_seconds(cli),
-        ),
+        );
+    };
+    if let [only] = servers.as_slice() {
+        return build(only.host().to_owned(), only.port(), only.encrypted());
     }
+    // Several selected servers: the first that answers, in the selection's
+    // order, as the shared stack would fail over. A down server is skipped,
+    // never replaced by one outside the selection.
+    let mut tried = Vec::new();
+    for server in &servers {
+        let client = build(server.host().to_owned(), server.port(), server.encrypted())?;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(CANDIDATE_PROBE_SECS),
+            client.server_version(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(client),
+            Ok(Err(error)) => tried.push(format!("{}: {error}", client.endpoint())),
+            Err(_) => tried.push(format!("{}: no answer", client.endpoint())),
+        }
+    }
+    Err(CliError::Usage(format!(
+        "no selected Electrum server answered: {}",
+        tried.join("; ")
+    )))
 }
 
 fn timeout_seconds(cli: &Cli) -> u64 {
@@ -792,7 +946,9 @@ fn timeout_seconds(cli: &Cli) -> u64 {
         if matches!(
             &cli.command,
             Command::Rescan { .. }
+                | Command::Fusion { .. }
                 | Command::History { .. }
+                | Command::Tokens { .. }
                 | Command::Wallet { .. }
                 | Command::Rpa {
                     action: RpaCommand::Discover { .. } | RpaCommand::Sweep { .. }
@@ -815,6 +971,22 @@ fn append_network_config_dir(base: &mut Vec<String>, directory: Option<&Path>) -
     base.push("--network-config-dir".into());
     base.push(directory.into());
     Ok(())
+}
+
+fn read_network_configuration(path: &std::path::Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| CliError::Usage("Cannot open network configuration file.".into()))?
+        .take(128 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CliError::Usage("Cannot read network configuration file.".into()))?;
+    if bytes.len() > 128 * 1024 {
+        return Err(CliError::Usage(
+            "Network configuration file is too large.".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn shared_network_status(cli: &Cli) -> Result<Value> {
@@ -862,6 +1034,10 @@ fn shared_network_status(cli: &Cli) -> Result<Value> {
             })
         })
         .collect::<Vec<_>>();
+    let tor = match selection.policy.transport {
+        optn_runtime::chain::TransportPolicy::Tor => "on",
+        optn_runtime::chain::TransportPolicy::Direct => "off",
+    };
     Ok(json!({
         "ok": true,
         "network": cli.network.to_string(),
@@ -872,21 +1048,65 @@ fn shared_network_status(cli: &Cli) -> Result<Value> {
             "fallback_scope": selection.policy.fallback_scope.as_ref().map(|scope| format!("{scope:?}")),
             "preferred": selection.policy.preferred.iter().map(|source| source.as_str()).collect::<Vec<_>>(),
         },
+        "tor": tor,
         "sources": sources,
         "primary": plan.primary.iter().map(|source| source.as_str()).collect::<Vec<_>>(),
         "fallback": plan.fallback.iter().map(|source| source.as_str()).collect::<Vec<_>>(),
     }))
 }
 
-async fn verify_selected_headers(cli: &Cli, start: Option<u32>, count: u32) -> Result<Value> {
-    if count < 2 {
-        return Err(CliError::Usage(
-            "header verification needs at least 2 consecutive headers".into(),
-        ));
+async fn fetch_headers_window(
+    cli: &Cli,
+    start: Option<u32>,
+    count: u32,
+) -> Result<(Vec<[u8; 80]>, u32, Option<u32>, String)> {
+    if let Some(selection) = configured_chain(cli)? {
+        let plan = build_selection_plan(&selection.catalog, &selection.policy);
+        let p2p = plan.primary.iter().any(|id| {
+            selection.catalog.get(id).is_some_and(|source| {
+                source
+                    .endpoints
+                    .iter()
+                    .any(|endpoint| matches!(endpoint.kind, EndpointKind::BchP2p))
+            })
+        });
+        if p2p {
+            let start_height = start.unwrap_or(1).max(1);
+            let stack = crate::network_settings::build_stack(
+                cli.network,
+                cli.network_config_dir.as_deref(),
+                selection,
+            )
+            .await;
+            let observation = stack
+                .service
+                .lock()
+                .await
+                .execute(&ChainRequest::HeaderSync {
+                    start_height,
+                    count,
+                })
+                .await
+                .map_err(|error| CliError::Network(format!("header sync failed: {error:?}")))?;
+            let ChainPayload::Headers {
+                start_height,
+                headers,
+            } = observation.value
+            else {
+                return Err(CliError::Protocol(
+                    "header route returned an unexpected payload".into(),
+                ));
+            };
+            return Ok((
+                headers,
+                start_height,
+                None,
+                observation.source.as_str().to_owned(),
+            ));
+        }
     }
-    let client = client_for(cli)?;
+    let client = client_for(cli).await?;
     let (tip_height, _) = client.tip().await?;
-    let count = count.min(2016);
     let start_height = match start {
         Some(height) => height,
         None => tip_height.saturating_sub(count.saturating_sub(1)),
@@ -899,21 +1119,72 @@ async fn verify_selected_headers(cli: &Cli, start: Option<u32>, count: u32) -> R
     let available = tip_height.saturating_sub(start_height).saturating_add(1);
     let count = count.min(available);
     let headers = client.block_headers(start_height, count).await?;
+    Ok((headers, start_height, Some(tip_height), client.endpoint()))
+}
+
+async fn verify_selected_headers(cli: &Cli, start: Option<u32>, count: u32) -> Result<Value> {
+    if count < 2 {
+        return Err(CliError::Usage(
+            "header verification needs at least 2 consecutive headers".into(),
+        ));
+    }
+    let count = count.min(2016);
+    let (headers, start_height, tip_height, via) = fetch_headers_window(cli, start, count).await?;
     if headers.len() < 2 {
         return Err(CliError::Protocol(
             "server returned fewer than 2 headers".into(),
         ));
     }
     let checked = verify_header_batch(cli.network, start_height, &headers)?;
+    let mut header_verifier = false;
+    let mut mmr = false;
+    let mut header_height = None;
+    let mut header_commitment = None;
+    let mut header_evidence = None;
+    if cli.network == Network::Chipnet {
+        let linked = if start_height == 1 {
+            headers.clone()
+        } else {
+            fetch_headers_window(cli, Some(1), count.max(2)).await?.0
+        };
+        if linked.len() >= 2 {
+            use optn_runtime::chain::{BlockHeaderBytes, HeaderVerifier};
+            let mut verifier = optn_runtime::header_verifier::shipped_chipnet_header_verifier()
+                .map_err(|error| {
+                    CliError::Protocol(format!("Chipnet header verifier: {error:?}"))
+                })?;
+            let batch: Vec<_> = linked.iter().copied().map(BlockHeaderBytes).collect();
+            verifier.extend(&batch).map_err(|error| {
+                CliError::Protocol(format!("Chipnet header extend failed: {error:?}"))
+            })?;
+            let state = verifier
+                .state()
+                .map_err(|error| CliError::Protocol(format!("Chipnet header state: {error:?}")))?;
+            header_verifier = true;
+            mmr = state.height > 0;
+            header_height = Some(state.height);
+            header_commitment = Some(hex(&state.commitment));
+            header_evidence = Some(if mmr {
+                "HeaderMmrProven"
+            } else {
+                "GenesisAttached"
+            });
+        }
+    }
     Ok(json!({
         "ok": true,
         "network": cli.network.to_string(),
-        "endpoint": client.endpoint(),
+        "endpoint": via,
         "tip_height": tip_height,
         "start_height": start_height,
         "count": headers.len(),
         "asert": true,
         "evidence": "HeaderLinked",
+        "header_verifier": header_verifier,
+        "mmr": mmr,
+        "header_height": header_height,
+        "header_commitment": header_commitment,
+        "header_evidence": header_evidence,
         "last_height": start_height + u32::try_from(headers.len().saturating_sub(1))
             .map_err(|_| CliError::Protocol("header count exceeds u32".into()))?,
         "last_hash": hex(&checked),
@@ -958,7 +1229,7 @@ async fn ping_selected_chain(cli: &Cli) -> Result<Value> {
     // Command-line endpoint flags are an explicit per-invocation override.
     // Without one, the CLI uses the exact durable selection shared with Tauri.
     if cli.host.is_some() || cli.port.is_some() || cli.no_tls {
-        let client = client_for(cli)?;
+        let client = client_for(cli).await?;
         let version = client.server_version().await?;
         return Ok(json!({
             "ok": true,
@@ -973,7 +1244,7 @@ async fn ping_selected_chain(cli: &Cli) -> Result<Value> {
         network_settings::shared_chain_selection(cli.network, cli.network_config_dir.as_deref())
             .map_err(CliError::Usage)?
     else {
-        let client = client_for(cli)?;
+        let client = client_for(cli).await?;
         let version = client.server_version().await?;
         return Ok(json!({
             "ok": true,
@@ -984,11 +1255,10 @@ async fn ping_selected_chain(cli: &Cli) -> Result<Value> {
         }));
     };
 
-    let stack = build_native_chain_stack(
-        selection.catalog,
-        selection.policy,
-        &cli.network.to_string(),
-        &NativeChainSecrets::default(),
+    let stack = crate::network_settings::build_stack(
+        cli.network,
+        cli.network_config_dir.as_deref(),
+        selection,
     )
     .await;
     let routes = stack
@@ -1076,17 +1346,16 @@ async fn transaction_selected_chain(cli: &Cli, txid: &str, verbose: bool) -> Res
     let mut requested = decode_hex32(txid)?;
     requested.reverse();
     let Some(selection) = configured_chain(cli)? else {
-        let transaction = client_for(cli)?.transaction(txid, verbose).await?;
+        let transaction = client_for(cli).await?.transaction(txid, verbose).await?;
         return Ok(json!({"ok": true, "txid": txid, "transaction": transaction}));
     };
     tokio::time::timeout(
         std::time::Duration::from_secs(timeout_seconds(cli)),
         async {
-            let stack = build_native_chain_stack(
-                selection.catalog,
-                selection.policy,
-                &cli.network.to_string(),
-                &NativeChainSecrets::default(),
+            let stack = crate::network_settings::build_stack(
+                cli.network,
+                cli.network_config_dir.as_deref(),
+                selection,
             )
             .await;
             let observation = stack
@@ -1127,17 +1396,16 @@ async fn broadcast_selected_chain(cli: &Cli, raw: &str) -> Result<Value> {
     }
     let txid = optn_core::header_hash::sha256d(&bytes);
     let Some(selection) = configured_chain(cli)? else {
-        let txid = client_for(cli)?.broadcast(raw).await?;
+        let txid = client_for(cli).await?.broadcast(raw).await?;
         return Ok(json!({"ok": true, "network": cli.network.to_string(), "txid": txid}));
     };
     let budget = std::time::Duration::from_secs(timeout_seconds(cli));
     let stack = tokio::time::timeout(
         budget,
-        build_native_chain_stack(
-            selection.catalog,
-            selection.policy,
-            &cli.network.to_string(),
-            &NativeChainSecrets::default(),
+        crate::network_settings::build_stack(
+            cli.network,
+            cli.network_config_dir.as_deref(),
+            selection,
         ),
     )
     .await;
@@ -1179,7 +1447,7 @@ async fn address_selected_chain(cli: &Cli, address: &str, include_outputs: bool)
     let scripthash = parsed.electrum_scripthash();
     let Some(selection) = configured_chain(cli)? else {
         if include_outputs {
-            let utxos = client_for(cli)?.utxos(&scripthash).await?;
+            let utxos = client_for(cli).await?.utxos(&scripthash).await?;
             let total: u64 = utxos.iter().map(|output| output.value).sum();
             return Ok(
                 json!({"ok": true, "network": cli.network.to_string(), "address": address,
@@ -1188,7 +1456,7 @@ async fn address_selected_chain(cli: &Cli, address: &str, include_outputs: bool)
                 })).collect::<Vec<_>>()}),
             );
         }
-        let balance = client_for(cli)?.balance(&scripthash).await?;
+        let balance = client_for(cli).await?.balance(&scripthash).await?;
         return Ok(
             json!({"ok": true, "network": cli.network.to_string(), "address": address,
             "scripthash": scripthash, "confirmed": balance.confirmed, "unconfirmed": balance.unconfirmed,
@@ -1197,12 +1465,7 @@ async fn address_selected_chain(cli: &Cli, address: &str, include_outputs: bool)
     };
     tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds(cli)), async {
         let mut worker = hd_sync_worker(cli.network, &selection.policy)?;
-        let stack = build_native_chain_stack(
-            selection.catalog,
-            selection.policy,
-            &cli.network.to_string(),
-            &NativeChainSecrets::default(),
-        )
+        let stack = crate::network_settings::build_stack(cli.network, cli.network_config_dir.as_deref(), selection)
         .await;
         let script = parsed.script_pubkey();
         // A one-address observation session, not the user's stored HD wallet.
@@ -1270,14 +1533,32 @@ async fn address_selected_chain(cli: &Cli, address: &str, include_outputs: bool)
     .map_err(|_| CliError::Network("shared wallet refresh timed out".into()))?
 }
 
-async fn rescan_shared_wallet(
+struct SyncedHdWallet {
+    state: optn_app::AppState,
+    snapshot: optn_runtime::reconciliation::ReconciledSnapshot<
+        optn_runtime::sync_worker::WalletNetworkSnapshot,
+    >,
+    worker: optn_runtime::sync_worker::ProgressiveSyncWorker,
+}
+
+impl SyncedHdWallet {
+    fn address_book(&self) -> Result<&optn_core::watch_only::HdAddressBook> {
+        self.snapshot
+            .value
+            .hd
+            .as_ref()
+            .ok_or_else(|| CliError::Protocol("HD rescan has no address book".into()))
+    }
+}
+
+async fn sync_shared_wallet(
     cli: &Cli,
     gap: u32,
     cap: u32,
-    all: bool,
     account_path: Option<&str>,
     xpub: Option<&str>,
-) -> Result<Value> {
+    from_height: Option<u32>,
+) -> Result<SyncedHdWallet> {
     use optn_runtime::chain::{
         ChainSource, ConnectionPolicy, Endpoint, EndpointKind, SourceCatalog, SourceDisposition,
         SourceId, SourceOrigin,
@@ -1361,59 +1642,251 @@ async fn rescan_shared_wallet(
             }
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(timeout_seconds(cli)), async {
-        let runtime = managed.cloned().unwrap_or_else(|| optn_runtime::AppRuntime::spawn(optn_app::AppState {
-            network: cli.network,
-            wallet: Some(optn_app::OpenedWallet {
-                kind: optn_app::WalletKind::WatchOnly, name: "HD account rescan".into(),
-                receive_address: receive.address, master_fingerprint: None, account_path: account.to_string(),
-                multisig_policy: None, account_xpub: Some(xpub.clone()),
-            }), ..Default::default()
-        }));
-        let mut worker = hd_sync_worker(cli.network, &selection.policy)?;
-        let stack = build_native_chain_stack(selection.catalog, selection.policy, &cli.network.to_string(), &NativeChainSecrets::default()).await;
-        runtime.sync_hd_wallet(&mut *stack.service.lock().await, &mut worker, xpub,
-            optn_runtime::hd_sync::HdSyncLimits { gap_limit: gap, addresses_per_branch: cap })
-            .await.map_err(|error| CliError::Network(format!("HD rescan incomplete: {error}")))?;
-        let status = runtime.subscribe_wallet_sync().borrow().clone();
-        if !status.sync.history_fresh || !status.sync.utxos_fresh {
-            return Err(CliError::Network("HD rescan did not publish a complete account".into()));
-        }
-        let snapshot = status.authoritative.ok_or_else(|| CliError::Protocol("HD rescan has no snapshot".into()))?;
-        let book = snapshot.value.hd.as_ref().ok_or_else(|| CliError::Protocol("HD rescan has no address book".into()))?;
-        let mut addresses = Vec::new();
-        for (branch, entries) in book.branches.iter().enumerate() {
-            for (index, address) in entries.iter().enumerate() {
-                let script = Address::decode(&address.address).map_err(CliError::Protocol)?.script_pubkey();
-                let (confirmed, unconfirmed) = snapshot.value.script_balance(&script)?;
-                let utxos = snapshot.value.script_outputs(&script)?;
-                if all || confirmed != 0 || unconfirmed != 0 || !utxos.is_empty() {
-                    addresses.push(json!({"path": address.path, "address": address.address,
-                        "chain": (["receiving", "change", "defi", "compatibility"][branch]),
-                        "branch":optn_core::watch_only::HD_SCAN_BRANCHES[branch], "index": index,
-                        "confirmed": confirmed, "unconfirmed": unconfirmed, "utxos": utxos.len()}));
-                }
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_seconds(cli)),
+        async {
+            let runtime = managed.cloned().unwrap_or_else(|| {
+                optn_runtime::AppRuntime::spawn(optn_app::AppState {
+                    network: cli.network,
+                    wallet: Some(optn_app::OpenedWallet {
+                        kind: optn_app::WalletKind::WatchOnly,
+                        name: "HD account rescan".into(),
+                        receive_address: receive.address,
+                        master_fingerprint: None,
+                        account_path: account.to_string(),
+                        multisig_policy: None,
+                        account_xpub: Some(xpub.clone()),
+                    }),
+                    ..Default::default()
+                })
+            });
+            if let Some(height) = from_height {
+                runtime
+                    .request_wallet_rescan(height)
+                    .await
+                    .map_err(|error| CliError::Usage(error.to_string()))?;
+            }
+            let worker = hd_sync_worker(cli.network, &selection.policy)?;
+            let stack = crate::network_settings::build_stack(
+                cli.network,
+                cli.network_config_dir.as_deref(),
+                selection,
+            )
+            .await;
+            let mut worker = seed_header_progress(
+                &runtime,
+                cli.network,
+                worker.with_accepted_headers(stack.headers.clone()),
+            )
+            .await?;
+            runtime
+                .sync_hd_wallet_from_floor(
+                    &mut *stack.service.lock().await,
+                    &mut worker,
+                    xpub,
+                    optn_runtime::hd_sync::HdSyncLimits {
+                        gap_limit: gap,
+                        addresses_per_branch: cap,
+                    },
+                    from_height,
+                )
+                .await
+                .map_err(|error| CliError::Network(format!("HD rescan incomplete: {error}")))?;
+            let status = runtime.subscribe_wallet_sync().borrow().clone();
+            if !status.sync.history_fresh || !status.sync.utxos_fresh {
+                return Err(CliError::Network(
+                    "HD rescan did not publish a complete account".into(),
+                ));
+            }
+            let snapshot = status
+                .authoritative
+                .ok_or_else(|| CliError::Protocol("HD rescan has no snapshot".into()))?;
+            let state = runtime.state();
+            if !state.wallet_sync.history_fresh
+                || !state.wallet_sync.utxos_fresh
+                || state.wallet.is_none()
+            {
+                return Err(CliError::Network(
+                    "HD wallet session ended before reporting its result".into(),
+                ));
+            }
+            Ok(SyncedHdWallet {
+                state,
+                snapshot,
+                worker,
+            })
+        },
+    )
+    .await
+    .map_err(|_| CliError::Network("HD rescan timed out before completing the account".into()))?
+}
+
+async fn rescan_shared_wallet(
+    cli: &Cli,
+    gap: u32,
+    cap: u32,
+    all: bool,
+    account_path: Option<&str>,
+    xpub: Option<&str>,
+    from_height: Option<u32>,
+) -> Result<Value> {
+    let synced = sync_shared_wallet(cli, gap, cap, account_path, xpub, from_height).await?;
+    let book = synced.address_book()?;
+    let snapshot = &synced.snapshot;
+    let state = &synced.state;
+    let mut addresses = Vec::new();
+    for (branch, entries) in book.branches.iter().enumerate() {
+        for (index, address) in entries.iter().enumerate() {
+            let script = Address::decode(&address.address)
+                .map_err(CliError::Protocol)?
+                .script_pubkey();
+            let (confirmed, unconfirmed) = snapshot.value.script_balance(&script)?;
+            let utxos = snapshot.value.script_outputs(&script)?;
+            if all || confirmed != 0 || unconfirmed != 0 || !utxos.is_empty() {
+                addresses.push(json!({"path": address.path, "address": address.address,
+                    "chain": (["receiving", "change", "defi", "compatibility"][branch]),
+                    "branch":optn_core::watch_only::HD_SCAN_BRANCHES[branch], "index": index,
+                    "confirmed": confirmed, "unconfirmed": unconfirmed, "utxos": utxos.len()}));
             }
         }
-        let state = runtime.state();
-        if !state.wallet_sync.history_fresh || !state.wallet_sync.utxos_fresh || state.wallet.is_none() {
-            return Err(CliError::Network("HD wallet session ended before reporting its result".into()));
+    }
+    let confirmed_total = state
+        .wallet_sync
+        .confirmed_sats
+        .ok_or_else(|| CliError::Protocol("HD balance is unavailable".into()))?;
+    let unconfirmed_total = state.wallet_sync.pending_sats;
+    let total = state
+        .wallet_sync
+        .total_sats()
+        .ok_or_else(|| CliError::Protocol("HD total balance overflow".into()))?;
+    let (header_verifier, mmr, header_height, header_commitment, header_evidence) =
+        header_verifier_report(&synced.worker);
+    Ok(
+        json!({"ok":true, "hd":true, "complete":!state.wallet_sync.scan_coverage.is_some_and(|coverage| coverage.skipped_below.is_some()), "network":cli.network.to_string(),
+        "account_path":book.account.to_string(), "gap":gap, "max_addresses":cap,
+        "selection":"shared-native-policy", "source":snapshot.source.as_str(),
+        "evidence":format!("{:?}",snapshot.evidence),
+        "header_verifier": header_verifier,
+        "mmr": mmr,
+        "header_height": header_height,
+        "header_commitment": header_commitment,
+        "header_evidence": header_evidence,
+        "branches":optn_core::watch_only::HD_SCAN_BRANCHES, "last_used":book.last_used,
+        "scanned_addresses":snapshot.value.interests.len(), "confirmed":confirmed_total,
+        "unconfirmed":unconfirmed_total, "total":total, "utxos":state.coins.len(), "addresses":addresses,
+        "wallet_sync":optn_transport::WireState::from(state).wallet_sync}),
+    )
+}
+
+fn tokens_from_shared_wallet(synced: &SyncedHdWallet) -> Result<Value> {
+    let state = &synced.state;
+    let book = synced.address_book()?;
+    let paths: std::collections::BTreeMap<_, _> = book
+        .branches
+        .iter()
+        .flatten()
+        .map(|address| (address.address.as_str(), address.path.as_str()))
+        .collect();
+    let mut fungible = std::collections::BTreeMap::<String, u128>::new();
+    let mut nfts = Vec::new();
+    let mut token_utxos = 0usize;
+    for coin in state.coins.iter() {
+        let Some(token) = coin.token() else { continue };
+        let path = paths.get(coin.address()).ok_or_else(|| {
+            CliError::Protocol("Token output is outside the synced HD account".into())
+        })?;
+        token_utxos += 1;
+        let category = token.category_hex();
+        if token.amount > 0 {
+            let total = fungible.entry(category.clone()).or_default();
+            *total = total
+                .checked_add(u128::from(token.amount))
+                .ok_or_else(|| CliError::Protocol("Token balance overflow".into()))?;
         }
-        let confirmed_total = state.wallet_sync.confirmed_sats.ok_or_else(|| CliError::Protocol("HD balance is unavailable".into()))?;
-        let unconfirmed_total = state.wallet_sync.pending_sats;
-        let total = state.wallet_sync.total_sats().ok_or_else(|| CliError::Protocol("HD total balance overflow".into()))?;
-        Ok(json!({"ok":true, "hd":true, "complete":true, "network":cli.network.to_string(),
-            "account_path":account.to_string(), "gap":gap, "max_addresses":cap,
-            "selection":"shared-native-policy", "source":snapshot.source.as_str(),
-            "evidence":format!("{:?}",snapshot.evidence),
-            "header_verifier": worker.header_verifier().is_some(),
-            "mmr": worker.header_verifier().is_some()
-                && !matches!(snapshot.evidence, optn_runtime::chain::Evidence::ServerAssertion),
-            "branches":optn_core::watch_only::HD_SCAN_BRANCHES, "last_used":book.last_used,
-            "scanned_addresses":snapshot.value.interests.len(), "confirmed":confirmed_total,
-            "unconfirmed":unconfirmed_total, "total":total, "utxos":state.coins.len(), "addresses":addresses,
-            "wallet_sync":optn_transport::WireState::from(&state).wallet_sync}))
-    }).await.map_err(|_| CliError::Network("HD rescan timed out before completing the account".into()))?
+        if let Some(nft) = &token.nft {
+            nfts.push(json!({
+                "category": category,
+                "capability": nft.capability.as_str(),
+                "commitment": hex(&nft.commitment),
+                "txid": coin.outpoint().txid_hex(),
+                "vout": coin.outpoint().vout(),
+                "path": path,
+            }));
+        }
+    }
+    Ok(json!({
+        "ok": true,
+        "network": state.network.to_string(),
+        "token_utxos": token_utxos,
+        "fungible": fungible.iter().map(|(category, amount)| json!({
+            "category": category,
+            "amount": amount.to_string(),
+        })).collect::<Vec<_>>(),
+        "nfts": nfts,
+        "scope": {
+            "kind": "hd-account",
+            "account_path": book.account.to_string(),
+            "branches": optn_core::watch_only::HD_SCAN_BRANCHES,
+        },
+        "source": synced.snapshot.source.as_str(),
+        "evidence": format!("{:?}", synced.snapshot.evidence),
+        "scan_coverage": state.wallet_sync.scan_coverage.as_ref().map(optn_transport::WireScanCoverage::from),
+        "complete": state.wallet_sync.scan_coverage.is_some_and(|coverage| coverage.skipped_below.is_none()),
+    }))
+}
+
+fn header_verifier_report(
+    worker: &optn_runtime::sync_worker::ProgressiveSyncWorker,
+) -> (
+    bool,
+    bool,
+    Option<u32>,
+    Option<String>,
+    Option<&'static str>,
+) {
+    match worker.header_verifier() {
+        None => (false, false, None, None, None),
+        Some(verifier) => match verifier.state() {
+            Ok(state) => {
+                let advanced = state.height > 0;
+                (
+                    true,
+                    advanced,
+                    Some(state.height),
+                    Some(hex(&state.commitment)),
+                    Some(if advanced {
+                        "HeaderMmrProven"
+                    } else {
+                        "GenesisAttached"
+                    }),
+                )
+            }
+            Err(_) => (true, false, None, None, Some("GenesisAttached")),
+        },
+    }
+}
+
+/// Seed a worker with the accumulator this wallet last had sealed.
+///
+/// `None` is the ordinary case for a fresh wallet, a record written before
+/// header progress was persisted, or one that has never completed a pass --
+/// all of which start from the shipped genesis anchor, as every run did
+/// before this existed.
+async fn seed_header_progress(
+    runtime: &optn_runtime::AppRuntime,
+    network: Network,
+    worker: optn_runtime::sync_worker::ProgressiveSyncWorker,
+) -> Result<optn_runtime::sync_worker::ProgressiveSyncWorker> {
+    let Some(progress) = runtime
+        .restored_header_progress()
+        .await
+        .map_err(|error| CliError::Network(format!("restored header progress: {error}")))?
+    else {
+        return Ok(worker);
+    };
+    worker
+        .with_stored_header_progress(network, &progress)
+        .map_err(|error| CliError::Usage(format!("stored header progress is unusable: {error:?}")))
 }
 
 fn hd_sync_worker(
@@ -1421,29 +1894,37 @@ fn hd_sync_worker(
     policy: &optn_runtime::chain::ConnectionPolicy,
 ) -> Result<optn_runtime::sync_worker::ProgressiveSyncWorker> {
     use optn_runtime::chain::ProtocolFamily;
-    let worker = optn_runtime::sync_worker::ProgressiveSyncWorker::new(Default::default());
+    use optn_runtime::sync_worker::ProgressiveSyncConfig;
     let p2p = policy.protocols.contains(ProtocolFamily::Bip37)
         || policy.protocols.contains(ProtocolFamily::Neutrino);
+    let mut config = ProgressiveSyncConfig::default();
     if !p2p {
-        return Ok(worker);
+        // Electrum: one real linked batch so the verifier is used. Wallet
+        // evidence stays ServerAssertion; do not walk every header on the
+        // chain on every balance query.
+        config.max_verified_headers_per_pass = Some(config.header_batch_size.max(1));
     }
-    if network != Network::Chipnet {
-        return Err(CliError::Usage(
-            "BIP37/Neutrino refresh needs a host-authenticated header checkpoint for this network"
-                .into(),
-        ));
-    }
-    let verifier = optn_runtime::header_verifier::shipped_chipnet_header_verifier()
-        .map_err(|e| CliError::Usage(format!("Chipnet header verifier: {e:?}")))?;
+    let worker = optn_runtime::sync_worker::ProgressiveSyncWorker::new(config);
+    // Every network anchors at its own genesis, so there is no longer a
+    // network that has to refuse for want of a checkpoint. The verifier is
+    // attached whatever the protocol; what changes between them is how far it
+    // is carried, and Electrum first-paint stays `ServerAssertion` either way.
+    let verifier = optn_runtime::header_verifier::shipped_header_verifier(network)
+        .map_err(|e| CliError::Usage(format!("{network} header verifier: {e:?}")))?;
     worker
         .with_header_verifier(network, verifier)
         .map_err(|e| CliError::Usage(format!("header verifier: {e:?}")))
 }
 
-async fn run(cli: &Cli) -> Result<Value> {
+fn authorize_command(cli: &Cli) -> Result<()> {
     // Before anything else, including opening a connection. A refusal should
     // cost nothing and reveal nothing about the wallet.
     skills::enforce(skills::Policy::from_env()?, command_name(&cli.command))?;
+    if matches!(cli.command, Command::Psbt { .. })
+        && SERVING.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(CliError::Usage("PSBT files require the local CLI.".into()));
+    }
     if cli.wallet.is_some()
         && (matches!(cli.command, Command::Serve { .. })
             || SERVING.load(std::sync::atomic::Ordering::SeqCst))
@@ -1453,14 +1934,173 @@ async fn run(cli: &Cli) -> Result<Value> {
         ));
     }
 
+    if matches!(
+        cli.command,
+        Command::Network {
+            action: NetworkCommand::Configure { .. }
+                | NetworkCommand::Import { .. }
+                | NetworkCommand::Policy { .. }
+                | NetworkCommand::Tor { .. }
+                | NetworkCommand::TorTrust { .. }
+                | NetworkCommand::Add { .. }
+                | NetworkCommand::Disposition { .. }
+                | NetworkCommand::Remove { .. }
+        }
+    ) && SERVING.load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(CliError::Usage(
+            "Source configuration requires the local CLI.".into(),
+        ));
+    }
     if let Command::Wallet { .. } = &cli.command {
         unreachable!("wallet console is handled in main before run()");
     }
+    Ok(())
+}
+
+async fn run(cli: &Cli) -> Result<Value> {
+    authorize_command(cli)?;
     match &cli.command {
+        Command::Psbt { original, signed } => {
+            let read = |path: &Path| -> Result<Vec<u8>> {
+                use std::io::Read;
+                let mut raw = String::new();
+                std::fs::File::open(path)
+                    .map_err(|_| CliError::Usage("Cannot open PSBT hex file.".into()))?
+                    .take(2 * 1024 * 1024 + 1)
+                    .read_to_string(&mut raw)
+                    .map_err(|_| CliError::Usage("Cannot read PSBT hex file.".into()))?;
+                if raw.len() > 2 * 1024 * 1024 {
+                    return Err(CliError::Usage("PSBT hex file exceeds 2 MiB.".into()));
+                }
+                decode_hex(raw.trim())
+            };
+            let original = read(original)?;
+            let review = optn_core::psbt::review_p2pkh(&original, cli.network)?;
+            let raw = signed
+                .as_ref()
+                .map(|path| {
+                    optn_core::psbt::finalize_cash_tokens_p2pkh(
+                        &original,
+                        &read(path)?,
+                        cli.network,
+                    )
+                })
+                .transpose()?;
+            return Ok(
+                json!({"ok":true, "network":cli.network.to_string(), "review":review,
+                "raw_transaction_hex":raw.as_ref().map(|bytes| hex(bytes)), "sent":false}),
+            );
+        }
         Command::Wallet { .. } => unreachable!("handled before network setup"),
         Command::Network {
             action: NetworkCommand::Status,
         } => return shared_network_status(cli),
+        Command::Network {
+            action: NetworkCommand::Policy { preset },
+        } => {
+            network_settings::set_policy_preset(
+                cli.network,
+                cli.network_config_dir.as_deref(),
+                network_settings::parse_policy_preset(preset).map_err(CliError::Usage)?,
+            )
+            .map_err(CliError::Usage)?;
+            return shared_network_status(cli);
+        }
+        Command::Network {
+            action: NetworkCommand::Tor { state },
+        } => {
+            network_settings::set_transport(
+                cli.network,
+                cli.network_config_dir.as_deref(),
+                network_settings::parse_tor_switch(state).map_err(CliError::Usage)?,
+            )
+            .map_err(CliError::Usage)?;
+            return shared_network_status(cli);
+        }
+        Command::Network {
+            action: NetworkCommand::TorTrust { port, remove },
+        } => {
+            let trusted = network_settings::set_trusted_socks_port(
+                cli.network,
+                cli.network_config_dir.as_deref(),
+                *port,
+                !*remove,
+            )
+            .map_err(CliError::Usage)?;
+            return Ok(json!({
+                "ok": true,
+                "network": cli.network.to_string(),
+                "trusted_socks_ports": trusted,
+            }));
+        }
+        Command::Network {
+            action: NetworkCommand::Export,
+        } => {
+            let json =
+                network_settings::export_sources(cli.network, cli.network_config_dir.as_deref())
+                    .map_err(CliError::Usage)?;
+            return serde_json::from_str(&json)
+                .map_err(|_| CliError::Internal("Invalid network configuration export.".into()));
+        }
+        Command::Network {
+            action: NetworkCommand::Import { file },
+        } => {
+            let bytes = read_network_configuration(file)?;
+            let json = std::str::from_utf8(&bytes)
+                .map_err(|_| CliError::Usage("Network configuration must be UTF-8.".into()))?;
+            network_settings::import_sources(cli.network, cli.network_config_dir.as_deref(), json)
+                .map_err(CliError::Usage)?;
+            return shared_network_status(cli);
+        }
+        Command::Network {
+            action: NetworkCommand::Configure { file },
+        } => {
+            let bytes = read_network_configuration(file)?;
+            let selection = serde_json::from_slice(&bytes)
+                .map_err(|_| CliError::Usage("Invalid source selection JSON.".into()))?;
+            network_settings::configure_sources(
+                cli.network,
+                cli.network_config_dir.as_deref(),
+                &selection,
+            )
+            .map_err(CliError::Usage)?;
+            return shared_network_status(cli);
+        }
+        Command::Network {
+            action: NetworkCommand::Add { file },
+        } => {
+            let bytes = read_network_configuration(file)?;
+            let request = serde_json::from_slice(&bytes)
+                .map_err(|_| CliError::Usage("Invalid AddSourceRequest JSON.".into()))?;
+            network_settings::add_source(cli.network, cli.network_config_dir.as_deref(), &request)
+                .map_err(CliError::Usage)?;
+            return shared_network_status(cli);
+        }
+        Command::Network {
+            action:
+                NetworkCommand::Disposition {
+                    source,
+                    disposition,
+                },
+        } => {
+            network_settings::set_source_disposition(
+                cli.network,
+                cli.network_config_dir.as_deref(),
+                source,
+                disposition,
+            )
+            .map_err(CliError::Usage)?;
+            return shared_network_status(cli);
+        }
+        Command::Network {
+            action: NetworkCommand::Remove { source },
+        } => {
+            network_settings::remove_source(cli.network, cli.network_config_dir.as_deref(), source)
+                .await
+                .map_err(CliError::Usage)?;
+            return shared_network_status(cli);
+        }
         Command::Network {
             action: NetworkCommand::Select { source, protocol },
         } => {
@@ -1488,17 +2128,13 @@ async fn run(cli: &Cli) -> Result<Value> {
 
     // Resolve the legacy route only when an operation actually needs it.
     // Cache it for the command so a settings edit cannot mix endpoints mid-scan.
-    let legacy_client = std::cell::OnceCell::new();
-    let client = || -> Result<&Client> {
-        if legacy_client.get().is_none() {
-            let _ = legacy_client.set(client_for(cli)?);
-        }
-        Ok(legacy_client.get().expect("client initialized above"))
-    };
+    let legacy_client = tokio::sync::OnceCell::new();
+    let client = || legacy_client.get_or_try_init(|| client_for(cli));
 
     match &cli.command {
         Command::Wallet { .. } => unreachable!("handled before network setup"),
         Command::Ping
+        | Command::Psbt { .. }
         | Command::Network { .. }
         | Command::Tx { .. }
         | Command::Broadcast { .. } => {
@@ -1527,11 +2163,13 @@ async fn run(cli: &Cli) -> Result<Value> {
             } => {
                 let network = match cli.network {
                     Network::Mainnet => MultisigNetwork::Mainnet,
-                    // The multisig core models two chains. Regtest shares
-                    // chipnet's address encoding, which is all this inspection
-                    // depends on, and saying so beats silently widening that
-                    // crate's own network model.
-                    Network::Chipnet | Network::Regtest => MultisigNetwork::Chipnet,
+                    // The multisig core models two chains. Every test chain
+                    // shares chipnet's address encoding, which is all this
+                    // inspection depends on, and saying so beats silently
+                    // widening that crate's own network model.
+                    Network::Testnet3 | Network::Testnet4 | Network::Chipnet | Network::Regtest => {
+                        MultisigNetwork::Chipnet
+                    }
                 };
                 let public_key_refs = public_keys.iter().map(String::as_str).collect::<Vec<_>>();
                 let inspection = inspect_p2sh20(network, *threshold, &public_key_refs)
@@ -1550,16 +2188,14 @@ async fn run(cli: &Cli) -> Result<Value> {
             }
         },
         Command::New { words } => {
-            // Lengths live in optn-core so the wallet UI cannot drift from `optn new`.
-            hd::entropy_len_for_word_count(*words)?;
-            // Generated by the bip39 crate from the OS RNG rather than by hand:
-            // entropy for a recovery phrase is not somewhere to improvise.
-            let mnemonic = Mnemonic::generate_in(Language::English, *words)
-                .map_err(|e| CliError::Internal(format!("mnemonic generation failed: {e}")))?;
+            // The generator every surface shares: the OS CSPRNG read directly,
+            // checked, and no fallback (see hd::generate_mnemonic). bip39's own
+            // generate_in would go through rand's userspace thread_rng.
+            let mnemonic = hd::generate_mnemonic(*words)?;
             Ok(json!({
                 "ok": true,
                 "words": words,
-                "mnemonic": mnemonic.to_string(),
+                "mnemonic": mnemonic.as_str(),
                 "warning": "anyone with this phrase controls the funds; store it offline",
             }))
         }
@@ -1594,6 +2230,7 @@ async fn run(cli: &Cli) -> Result<Value> {
             sats,
             fee_rate,
             gap,
+            max_addresses,
             dry_run,
             yes,
         } => {
@@ -1603,9 +2240,22 @@ async fn run(cli: &Cli) -> Result<Value> {
                 ));
             }
             let destination = parse_address(to, cli.network)?;
+            if cli.wallet.is_some() {
+                return send_from_saved_wallet(
+                    cli,
+                    to,
+                    &destination,
+                    *sats,
+                    *fee_rate,
+                    *gap,
+                    *max_addresses,
+                    *dry_run,
+                )
+                .await;
+            }
             let wallet = read_wallet(cli).await?;
             let spend = spend_to(
-                client()?,
+                client().await?,
                 cli.network,
                 &wallet,
                 destination.script_pubkey(),
@@ -1665,58 +2315,19 @@ async fn run(cli: &Cli) -> Result<Value> {
             }
             let wanted = token::parse_category(category)?;
             let wallet = read_wallet(cli).await?;
-            let coin = default_coin_type(cli.network);
-            const TOKEN_DUST: u64 = 1000;
-
-            let mut matches: Vec<(tx::Utxo, String, token::Nft, u64)> = Vec::new();
-            let mut plain_inputs: Vec<(tx::Utxo, String)> = Vec::new();
-
-            for change in [false, true] {
-                for index in 0..*gap {
-                    let path = hd::address_path(coin, 0, change, index);
-                    let address = wallet.address(cli.network, &path)?;
-                    for u in client()?.utxos(&address.electrum_scripthash()).await? {
-                        let mut txid = decode_hex32(&u.tx_hash)?;
-                        txid.reverse();
-                        let utxo = tx::Utxo {
-                            txid,
-                            vout: u.tx_pos,
-                            value: u.value,
-                            script_pubkey: address.script_pubkey(),
-                        };
-                        match &u.token_data {
-                            Some(t) if t.category.eq_ignore_ascii_case(category) => {
-                                let Some(nft) = &t.nft else { continue };
-                                let held = nft.commitment.clone().unwrap_or_default();
-                                if !commitment.is_empty() && !held.eq_ignore_ascii_case(commitment)
-                                {
-                                    continue;
-                                }
-                                let capability = match nft.capability.as_deref() {
-                                    Some("mutable") => token::Capability::Mutable,
-                                    Some("minting") => token::Capability::Minting,
-                                    _ => token::Capability::None,
-                                };
-                                let bytes = decode_hex(&held)?;
-                                let fungible: u64 =
-                                    t.amount.as_deref().unwrap_or("0").parse().unwrap_or(0);
-                                matches.push((
-                                    utxo,
-                                    path.clone(),
-                                    token::Nft {
-                                        capability,
-                                        commitment: bytes,
-                                    },
-                                    fungible,
-                                ));
-                            }
-                            Some(_) => {}
-                            None => plain_inputs.push((utxo, path.clone())),
-                        }
-                    }
-                }
-            }
-
+            let (coins, paths) = hd_coins_with_tokens(cli, client().await?, &wallet, *gap).await?;
+            let matches: Vec<&optn_core::coins::Coin> = coins
+                .iter()
+                .filter(|coin| {
+                    coin.token().is_some_and(|held| {
+                        held.category == wanted
+                            && held.nft.as_ref().is_some_and(|nft| {
+                                commitment.is_empty()
+                                    || hex(&nft.commitment).eq_ignore_ascii_case(commitment)
+                            })
+                    })
+                })
+                .collect();
             if matches.is_empty() {
                 return Err(CliError::Usage(format!(
                     "no NFT found for category {category}{}",
@@ -1732,7 +2343,8 @@ async fn run(cli: &Cli) -> Result<Value> {
                 // name, and NFTs are not interchangeable.
                 let seen: Vec<String> = matches
                     .iter()
-                    .map(|(_, _, nft, _)| hex(&nft.commitment))
+                    .filter_map(|coin| coin.token()?.nft.as_ref())
+                    .map(|nft| hex(&nft.commitment))
                     .collect();
                 return Err(CliError::Usage(format!(
                     "category {category} holds {} NFTs; pass --commitment to choose one of: {}",
@@ -1740,59 +2352,22 @@ async fn run(cli: &Cli) -> Result<Value> {
                     seen.join(", ")
                 )));
             }
-
-            let (nft_utxo, nft_path, nft, fungible) = matches.remove(0);
-            // The NFT keeps its capability and commitment. Any fungible amount
-            // riding on the same output travels with it, since dropping it here
-            // would destroy those tokens.
-            let moved = token::TokenData {
-                category: wanted,
-                amount: fungible,
-                nft: Some(nft.clone()),
-            };
-            let outputs = vec![tx::Output::with_tokens(
-                TOKEN_DUST,
-                destination.script_pubkey(),
-                moved.encode_prefix()?,
-            )];
-
-            let pool: Vec<tx::Utxo> = plain_inputs.iter().map(|(u, _)| u.clone()).collect();
-            let (funding, fee) = tx::select_coins(
-                &pool,
-                TOKEN_DUST.saturating_sub(nft_utxo.value),
+            let outpoint = matches[0].outpoint();
+            let nft = matches[0]
+                .token()
+                .and_then(|held| held.nft.clone())
+                .ok_or_else(|| CliError::Internal("the chosen coin lost its NFT".into()))?;
+            // The shared planner moves the NFT exactly as it is; fungible
+            // units on the same coin come back to this wallet as token change.
+            let plan = plan_token_send(
+                cli,
+                &wallet,
+                &coins,
+                to,
+                optn_core::spend::Payment::Nft { outpoint },
                 *fee_rate,
-                2,
             )?;
-
-            let mut inputs = vec![nft_utxo.clone()];
-            inputs.extend(funding.iter().cloned());
-            let mut outputs = outputs;
-            let funded: u64 = funding.iter().map(|u| u.value).sum();
-            let bch_change = (nft_utxo.value + funded).saturating_sub(TOKEN_DUST + fee);
-            let change_path = hd::address_path(coin, 0, true, 0);
-            if bch_change >= 546 {
-                outputs.push(tx::Output::new(
-                    bch_change,
-                    wallet.address(cli.network, &change_path)?.script_pubkey(),
-                ));
-            }
-
-            let transaction = tx::Transaction::new(inputs.clone(), outputs);
-            let mut keys = Vec::with_capacity(inputs.len());
-            for input in &inputs {
-                let path = if input.txid == nft_utxo.txid && input.vout == nft_utxo.vout {
-                    nft_path.clone()
-                } else {
-                    plain_inputs
-                        .iter()
-                        .find(|(u, _)| u.txid == input.txid && u.vout == input.vout)
-                        .map(|(_, p)| p.clone())
-                        .ok_or_else(|| CliError::Internal("selected an unknown utxo".into()))?
-                };
-                keys.push(wallet.signing_key(&path)?);
-            }
-            let raw = transaction.sign(&keys)?;
-            let raw_hex = hex(&raw);
+            let raw_hex = hex(&sign_token_plan(&wallet, &plan, &paths)?);
 
             if *dry_run {
                 return Ok(json!({
@@ -1803,12 +2378,13 @@ async fn run(cli: &Cli) -> Result<Value> {
                     "commitment": hex(&nft.commitment),
                     "capability": nft.capability.as_str(),
                     "to": to,
-                    "fee": fee,
+                    "fee": plan.fee_sats,
+                    "inputs": plan.inputs.len(),
                     "raw": raw_hex,
                 }));
             }
 
-            let txid = client()?.broadcast(&raw_hex).await?;
+            let txid = client().await?.broadcast(&raw_hex).await?;
             Ok(json!({
                 "ok": true,
                 "network": cli.network.to_string(),
@@ -1817,7 +2393,7 @@ async fn run(cli: &Cli) -> Result<Value> {
                 "commitment": hex(&nft.commitment),
                 "capability": nft.capability.as_str(),
                 "to": to,
-                "fee": fee,
+                "fee": plan.fee_sats,
             }))
         }
         Command::TokenSend {
@@ -1844,122 +2420,27 @@ async fn run(cli: &Cli) -> Result<Value> {
             }
             let wanted = token::parse_category(category)?;
             let wallet = read_wallet(cli).await?;
-            let coin = default_coin_type(cli.network);
-
-            // A token output still carries BCH. 1000 sats clears the dust
-            // threshold for the larger output a token prefix produces; the
-            // familiar 546 figure applies to a bare P2PKH.
-            const TOKEN_DUST: u64 = 1000;
-
-            let mut token_inputs: Vec<(tx::Utxo, String, u64)> = Vec::new();
-            let mut plain_inputs: Vec<(tx::Utxo, String)> = Vec::new();
-
-            for change in [false, true] {
-                for index in 0..*gap {
-                    let path = hd::address_path(coin, 0, change, index);
-                    let address = wallet.address(cli.network, &path)?;
-                    for u in client()?.utxos(&address.electrum_scripthash()).await? {
-                        let mut txid = decode_hex32(&u.tx_hash)?;
-                        txid.reverse();
-                        let utxo = tx::Utxo {
-                            txid,
-                            vout: u.tx_pos,
-                            value: u.value,
-                            script_pubkey: address.script_pubkey(),
-                        };
-                        match &u.token_data {
-                            Some(t) if t.category.eq_ignore_ascii_case(category) => {
-                                let held: u64 =
-                                    t.amount.as_deref().unwrap_or("0").parse().map_err(|_| {
-                                        CliError::Protocol("token amount is not a number".into())
-                                    })?;
-                                token_inputs.push((utxo, path.clone(), held));
-                            }
-                            // An output holding a different category cannot fund
-                            // the fee without destroying that token, so only
-                            // token-free outputs do.
-                            Some(_) => {}
-                            None => plain_inputs.push((utxo, path.clone())),
-                        }
-                    }
-                }
-            }
-
-            token_inputs.sort_by_key(|e| std::cmp::Reverse(e.2));
-            let mut selected: Vec<(tx::Utxo, String, u64)> = Vec::new();
-            let mut gathered: u64 = 0;
-            for entry in token_inputs {
-                gathered = gathered.saturating_add(entry.2);
-                selected.push(entry);
-                if gathered >= *amount {
-                    break;
-                }
-            }
-            if gathered < *amount {
-                return Err(CliError::Usage(format!(
-                    "holding {gathered} of category {category}, need {amount}"
-                )));
-            }
-            let token_change = gathered - amount;
-
-            let mut outputs = vec![tx::Output::with_tokens(
-                TOKEN_DUST,
-                destination.script_pubkey(),
-                token::TokenData::fungible(wanted, *amount).encode_prefix()?,
-            )];
-
-            let change_path = hd::address_path(coin, 0, true, 0);
-            let plain_change = wallet.address(cli.network, &change_path)?;
-            if token_change > 0 {
-                // Token change must land on a token-aware address for the same
-                // reason the destination must: a plain one destroys it.
-                let mut token_change_address = plain_change.clone();
-                token_change_address.kind = token_change_address.kind.token_aware();
-                outputs.push(tx::Output::with_tokens(
-                    TOKEN_DUST,
-                    token_change_address.script_pubkey(),
-                    token::TokenData::fungible(wanted, token_change).encode_prefix()?,
-                ));
-            }
-
-            // Token inputs bring their own BCH; only the shortfall needs funding.
-            let token_bch: u64 = selected.iter().map(|(u, ..)| u.value).sum();
-            let needed = TOKEN_DUST * outputs.len() as u64;
-            let pool: Vec<tx::Utxo> = plain_inputs.iter().map(|(u, _)| u.clone()).collect();
-            let (funding, fee) = tx::select_coins(
-                &pool,
-                needed.saturating_sub(token_bch),
+            let (coins, paths) = hd_coins_with_tokens(cli, client().await?, &wallet, *gap).await?;
+            let plan = plan_token_send(
+                cli,
+                &wallet,
+                &coins,
+                to,
+                optn_core::spend::Payment::Fungible {
+                    category: wanted,
+                    amount: *amount,
+                },
                 *fee_rate,
-                outputs.len() + 1,
             )?;
-
-            let mut inputs: Vec<tx::Utxo> = selected.iter().map(|(u, ..)| u.clone()).collect();
-            inputs.extend(funding.iter().cloned());
-
-            let funded: u64 = funding.iter().map(|u| u.value).sum();
-            let bch_change = (token_bch + funded).saturating_sub(needed + fee);
-            if bch_change >= 546 {
-                outputs.push(tx::Output::new(bch_change, plain_change.script_pubkey()));
-            }
-
-            let transaction = tx::Transaction::new(inputs.clone(), outputs);
-            let mut keys = Vec::with_capacity(inputs.len());
-            for input in &inputs {
-                let path = selected
-                    .iter()
-                    .find(|(u, ..)| u.txid == input.txid && u.vout == input.vout)
-                    .map(|(_, p, _)| p.clone())
-                    .or_else(|| {
-                        plain_inputs
-                            .iter()
-                            .find(|(u, _)| u.txid == input.txid && u.vout == input.vout)
-                            .map(|(_, p)| p.clone())
-                    })
-                    .ok_or_else(|| CliError::Internal("selected an unknown utxo".into()))?;
-                keys.push(wallet.signing_key(&path)?);
-            }
-            let raw = transaction.sign(&keys)?;
-            let raw_hex = hex(&raw);
+            let raw_hex = hex(&sign_token_plan(&wallet, &plan, &paths)?);
+            let token_change: u64 = plan
+                .outputs
+                .iter()
+                .filter(|output| output.role == optn_core::spend::OutputRole::TokenChange)
+                .filter_map(|output| output.token.as_ref())
+                .filter(|held| held.category == wanted)
+                .map(|held| held.amount)
+                .sum();
 
             if *dry_run {
                 return Ok(json!({
@@ -1970,13 +2451,13 @@ async fn run(cli: &Cli) -> Result<Value> {
                     "to": to,
                     "amount": amount,
                     "token_change": token_change,
-                    "fee": fee,
-                    "inputs": inputs.len(),
+                    "fee": plan.fee_sats,
+                    "inputs": plan.inputs.len(),
                     "raw": raw_hex,
                 }));
             }
 
-            let txid = client()?.broadcast(&raw_hex).await?;
+            let txid = client().await?.broadcast(&raw_hex).await?;
             Ok(json!({
                 "ok": true,
                 "network": cli.network.to_string(),
@@ -1984,62 +2465,23 @@ async fn run(cli: &Cli) -> Result<Value> {
                 "category": category,
                 "to": to,
                 "amount": amount,
-                "fee": fee,
+                "fee": plan.fee_sats,
             }))
         }
         Command::Tokens { gap } => {
-            let wallet = read_wallet(cli).await?;
-            let coin = default_coin_type(cli.network);
-            // category -> (fungible total, nft count)
-            let mut fungible: std::collections::BTreeMap<String, u128> = Default::default();
-            let mut nfts: Vec<Value> = Vec::new();
-            let mut token_utxos = 0usize;
-
-            for change in [false, true] {
-                for index in 0..*gap {
-                    let path = hd::address_path(coin, 0, change, index);
-                    let address = wallet.address(cli.network, &path)?;
-                    for u in client()?.utxos(&address.electrum_scripthash()).await? {
-                        let Some(t) = u.token_data else { continue };
-                        token_utxos += 1;
-                        if let Some(amount) = t.amount.as_deref() {
-                            // Sent as a decimal string because the top of the
-                            // range does not survive a JSON number.
-                            let parsed: u128 = amount.parse().map_err(|_| {
-                                CliError::Protocol(format!(
-                                    "token amount '{amount}' is not a number"
-                                ))
-                            })?;
-                            if parsed > 0 {
-                                *fungible.entry(t.category.clone()).or_default() += parsed;
-                            }
-                        }
-                        if let Some(nft) = t.nft {
-                            nfts.push(json!({
-                                "category": t.category,
-                                "capability": nft.capability.unwrap_or_else(|| "none".into()),
-                                "commitment": nft.commitment.unwrap_or_default(),
-                                "txid": u.tx_hash,
-                                "vout": u.tx_pos,
-                                "path": path,
-                            }));
-                        }
-                    }
-                }
-            }
-
-            Ok(json!({
-                "ok": true,
-                "network": cli.network.to_string(),
-                "token_utxos": token_utxos,
-                "fungible": fungible.iter().map(|(category, amount)| json!({
-                    "category": category,
-                    "amount": amount.to_string(),
-                })).collect::<Vec<_>>(),
-                "nfts": nfts,
-            }))
+            let synced = sync_shared_wallet(
+                cli,
+                *gap,
+                optn_core::discovery::ADDRESS_CAP.max(*gap),
+                None,
+                None,
+                None,
+            )
+            .await?;
+            tokens_from_shared_wallet(&synced)
         }
         Command::Rescan {
+            from_height,
             gap,
             all,
             max_addresses,
@@ -2053,6 +2495,47 @@ async fn run(cli: &Cli) -> Result<Value> {
                 *all,
                 account_path.as_deref(),
                 xpub.as_deref(),
+                *from_height,
+            )
+            .await
+        }
+        Command::Fusion {
+            server,
+            p2p,
+            relays,
+            auto,
+            rounds,
+            fuse_depth,
+            tiers,
+            gap,
+            max_addresses,
+            yes,
+        } => {
+            if !*yes {
+                return Err(CliError::Usage(
+                    "refusing to fuse without --yes: every round pays fees".to_string(),
+                ));
+            }
+            let venue = match (server.as_deref(), *p2p) {
+                (_, true) => fusion::Venue::P2p { relays },
+                (Some(server), false) => fusion::Venue::Server(server),
+                (None, false) => {
+                    return Err(CliError::Usage(
+                        "pass --server for a CashFusion server, or --p2p".to_string(),
+                    ))
+                }
+            };
+            fusion::run(
+                cli,
+                fusion::FusionArgs {
+                    venue,
+                    auto: *auto,
+                    rounds: *rounds,
+                    fuse_depth: *fuse_depth,
+                    tiers,
+                    gap: *gap,
+                    max_addresses: *max_addresses,
+                },
             )
             .await
         }
@@ -2062,6 +2545,7 @@ async fn run(cli: &Cli) -> Result<Value> {
                 *gap,
                 optn_core::discovery::ADDRESS_CAP.max(*gap),
                 false,
+                None,
                 None,
                 None,
             )
@@ -2089,7 +2573,10 @@ async fn run(cli: &Cli) -> Result<Value> {
                         for index in 0..*gap {
                             let path = hd::address_path(coin, account, change, index);
                             let address = wallet.address(cli.network, &path)?;
-                            let balance = client()?.balance(&address.electrum_scripthash()).await?;
+                            let balance = client()
+                                .await?
+                                .balance(&address.electrum_scripthash())
+                                .await?;
                             if balance.confirmed != 0 || balance.unconfirmed != 0 {
                                 used += 1;
                                 total += balance.confirmed + balance.unconfirmed;
@@ -2278,121 +2765,7 @@ async fn run(cli: &Cli) -> Result<Value> {
                 }
             }
         }
-        Command::Console { json } => {
-            use std::io::Write;
-
-            let mut base = vec!["--network".to_string(), cli.network.to_string()];
-            if cli.profile != "default" {
-                base.push("--profile".to_string());
-                base.push(cli.profile.clone());
-            }
-            append_network_config_dir(&mut base, cli.network_config_dir.as_deref())?;
-            let policy = skills::Policy::from_env()?;
-
-            eprintln!("optn console — {} ({})", cli.network, policy.ceiling());
-            eprintln!("`help` lists commands, `quit` leaves.");
-
-            let stdin = std::io::stdin();
-            loop {
-                eprint!("optn> ");
-                let _ = std::io::stderr().flush();
-
-                // Release stdin before dispatch so wallet authentication can read it.
-                let mut line = String::new();
-                if stdin
-                    .read_line(&mut line)
-                    .map_err(|e| CliError::Usage(format!("could not read input: {e}")))?
-                    == 0
-                {
-                    break;
-                }
-
-                let parsed = match console::parse(&line) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        eprintln!("error: {error}");
-                        continue;
-                    }
-                };
-
-                match parsed {
-                    console::Line::Empty => continue,
-                    console::Line::Quit => break,
-                    console::Line::Help => {
-                        // From the manifest, so it cannot list a command the
-                        // gate would refuse or omit one it allows.
-                        for skill in skills::SKILLS {
-                            let mark = if policy.admits(skill.capability) {
-                                ' '
-                            } else {
-                                'x'
-                            };
-                            eprintln!(
-                                "  {mark} {:<12} {:<7} {}",
-                                skill.name,
-                                skill.capability.as_str(),
-                                skill.summary
-                            );
-                        }
-                        eprintln!("  (x = refused by the current policy)");
-                        continue;
-                    }
-                    console::Line::Command(args) => {
-                        let argv = console::argv(&base, &args, *json);
-                        // Clap's nested parser can exceed the Windows main-thread stack
-                        // while this dispatch frame is live. Parse on the blocking pool.
-                        let parsed = tokio::task::spawn_blocking(move || Cli::try_parse_from(argv))
-                            .await
-                            .map_err(|_| {
-                                CliError::Internal("Console argument parsing failed.".into())
-                            })?;
-                        let mut parsed_cli = match parsed {
-                            Ok(parsed) => parsed,
-                            Err(error) => {
-                                // clap already formats this well; printing it
-                                // whole is better than paraphrasing it.
-                                eprintln!("{error}");
-                                continue;
-                            }
-                        };
-
-                        parsed_cli.wallet = parsed_cli.wallet.or_else(|| cli.wallet.clone());
-                        parsed_cli.wallet_directory = parsed_cli
-                            .wallet_directory
-                            .or_else(|| cli.wallet_directory.clone());
-                        parsed_cli.password_stdin |= cli.password_stdin;
-                        // Only reuse authentication for the same resolved wallet selection.
-                        // An explicit override keeps the parser's fresh session.
-                        if parsed_cli.wallet == cli.wallet
-                            && parsed_cli.wallet_directory == cli.wallet_directory
-                            && parsed_cli.network == cli.network
-                        {
-                            parsed_cli.wallet_session = std::sync::Arc::clone(&cli.wallet_session);
-                        }
-
-                        // Boxed for the same reason as serve: the console is
-                        // reached from run, and reaches it back.
-                        match Box::pin(run(&parsed_cli)).await {
-                            Ok(value) => {
-                                if *json {
-                                    println!(
-                                        "{}",
-                                        serde_json::to_string_pretty(&value).unwrap_or_default()
-                                    );
-                                } else {
-                                    print_human(&parsed_cli.command, &value);
-                                }
-                            }
-                            // Printed, not returned: one bad command should not
-                            // end the session.
-                            Err(error) => eprintln!("error: {error}"),
-                        }
-                    }
-                }
-            }
-
-            Ok(json!({ "ok": true, "console": "closed" }))
-        }
+        Command::Console { .. } => unreachable!("console is handled by dispatch"),
         Command::Serve {
             port,
             bind,
@@ -2581,11 +2954,10 @@ async fn run(cli: &Cli) -> Result<Value> {
                 let budget = std::time::Duration::from_secs(timeout_seconds(cli));
                 let stack = tokio::time::timeout(
                     budget,
-                    build_native_chain_stack(
-                        selection.catalog,
-                        selection.policy,
-                        &cli.network.to_string(),
-                        &NativeChainSecrets::default(),
+                    crate::network_settings::build_stack(
+                        cli.network,
+                        cli.network_config_dir.as_deref(),
+                        selection,
                     ),
                 )
                 .await
@@ -2669,11 +3041,10 @@ async fn run(cli: &Cli) -> Result<Value> {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(timeout_seconds(cli)),
                     async {
-                        let stack = build_native_chain_stack(
-                            selection.catalog,
-                            selection.policy,
-                            &cli.network.to_string(),
-                            &NativeChainSecrets::default(),
+                        let stack = crate::network_settings::build_stack(
+                            cli.network,
+                            cli.network_config_dir.as_deref(),
+                            selection,
                         )
                         .await;
                         let mut worker = worker.with_accepted_headers(stack.headers.clone());
@@ -2739,7 +3110,7 @@ async fn run(cli: &Cli) -> Result<Value> {
                     .to_bytes()
                     .into();
                 let spend_pub = wallet.public_key(&rpa::spend_path(coin, *account))?;
-                let raw_hex = client()?.transaction(txid, false).await?;
+                let raw_hex = client().await?.transaction(txid, false).await?;
                 let raw_hex = raw_hex.as_str().ok_or_else(|| {
                     CliError::Protocol("server did not return raw transaction hex".into())
                 })?;
@@ -2800,10 +3171,15 @@ async fn run(cli: &Cli) -> Result<Value> {
                     )));
                 }
                 let decoded = rpa::decode(code)?;
-                if decoded.network() != cli.network {
+                // A code only says mainnet or test network, never which test chain.
+                if !decoded.matches(cli.network) {
+                    let family = if decoded.is_mainnet() {
+                        "mainnet"
+                    } else {
+                        "a test network"
+                    };
                     return Err(CliError::Usage(format!(
-                        "that code is for {}, but this is {}",
-                        decoded.network(),
+                        "that code is for {family}, but this is {}",
                         cli.network
                     )));
                 }
@@ -2817,7 +3193,7 @@ async fn run(cli: &Cli) -> Result<Value> {
                         .await?
                 } else {
                     rpa_pay(
-                        client()?,
+                        client().await?,
                         cli.network,
                         &wallet,
                         &decoded,
@@ -2898,7 +3274,10 @@ async fn run(cli: &Cli) -> Result<Value> {
             }
         }
         Command::X402 { action } => match action {
-            X402Command::Check {
+            X402Command::Check(_) | X402Command::Pay(_) | X402Command::Status { .. } => {
+                unreachable!("exact protocol is dispatched through its native adapter")
+            }
+            X402Command::LegacyCheck {
                 url,
                 headers,
                 method,
@@ -2941,7 +3320,7 @@ async fn run(cli: &Cli) -> Result<Value> {
                     "options_offered": required.accepts.len(),
                 }))
             }
-            X402Command::Pay {
+            X402Command::LegacyPay {
                 url,
                 fund,
                 txid,
@@ -3016,7 +3395,7 @@ async fn run(cli: &Cli) -> Result<Value> {
                         )));
                     }
                     let spend = spend_to(
-                        client()?,
+                        client().await?,
                         cli.network,
                         &wallet,
                         destination.script_pubkey(),
@@ -3103,6 +3482,138 @@ async fn run(cli: &Cli) -> Result<Value> {
             }
         },
     }
+}
+
+/// Keep the large command dispatcher off the caller's stack.
+///
+/// `run` also dispatches console and local RPC commands back into itself. The
+/// Windows executable has a smaller main-thread stack than the platforms used
+/// for most development, so every production entry point crosses this heap
+/// boundary before polling that future.
+fn dispatch(cli: &Cli) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + '_>> {
+    match &cli.command {
+        Command::X402 {
+            action:
+                action @ (X402Command::Check(_) | X402Command::Pay(_) | X402Command::Status { .. }),
+        } => x402_exact::dispatch(cli, action),
+        Command::Console { json } => Box::pin(run_console(cli, json)),
+        _ => Box::pin(run(cli)),
+    }
+}
+
+// Keep the prompt outside the large command future: each entered command must
+// not poll underneath another copy of the full command dispatcher on Windows.
+async fn run_console(cli: &Cli, json: &bool) -> Result<Value> {
+    authorize_command(cli)?;
+    use std::io::Write;
+
+    let mut base = vec!["--network".to_string(), cli.network.to_string()];
+    if cli.profile != "default" {
+        base.push("--profile".to_string());
+        base.push(cli.profile.clone());
+    }
+    append_network_config_dir(&mut base, cli.network_config_dir.as_deref())?;
+    let policy = skills::Policy::from_env()?;
+
+    eprintln!("optn console — {} ({})", cli.network, policy.ceiling());
+    eprintln!("`help` lists commands, `quit` leaves.");
+
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("optn> ");
+        let _ = std::io::stderr().flush();
+
+        // Release stdin before dispatch so wallet authentication can read it.
+        let mut line = String::new();
+        if stdin
+            .read_line(&mut line)
+            .map_err(|e| CliError::Usage(format!("could not read input: {e}")))?
+            == 0
+        {
+            break;
+        }
+
+        let parsed = match console::parse(&line) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!("error: {error}");
+                continue;
+            }
+        };
+
+        match parsed {
+            console::Line::Empty => continue,
+            console::Line::Quit => break,
+            console::Line::Help => {
+                // From the manifest, so it cannot list a command the
+                // gate would refuse or omit one it allows.
+                for skill in skills::SKILLS {
+                    let mark = if policy.admits(skill.capability) {
+                        ' '
+                    } else {
+                        'x'
+                    };
+                    eprintln!(
+                        "  {mark} {:<12} {:<7} {}",
+                        skill.name,
+                        skill.capability.as_str(),
+                        skill.summary
+                    );
+                }
+                eprintln!("  (x = refused by the current policy)");
+                continue;
+            }
+            console::Line::Command(args) => {
+                let argv = console::argv(&base, &args, *json);
+                // Clap's nested parser can exceed the Windows main-thread stack
+                // while this dispatch frame is live. Parse on the blocking pool.
+                let parsed = tokio::task::spawn_blocking(move || Cli::try_parse_from(argv))
+                    .await
+                    .map_err(|_| CliError::Internal("Console argument parsing failed.".into()))?;
+                let mut parsed_cli = match parsed {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        // clap already formats this well; printing it
+                        // whole is better than paraphrasing it.
+                        eprintln!("{error}");
+                        continue;
+                    }
+                };
+
+                parsed_cli.wallet = parsed_cli.wallet.or_else(|| cli.wallet.clone());
+                parsed_cli.wallet_directory = parsed_cli
+                    .wallet_directory
+                    .or_else(|| cli.wallet_directory.clone());
+                parsed_cli.password_stdin |= cli.password_stdin;
+                // Only reuse authentication for the same resolved wallet selection.
+                // An explicit override keeps the parser's fresh session.
+                if parsed_cli.wallet == cli.wallet
+                    && parsed_cli.wallet_directory == cli.wallet_directory
+                    && parsed_cli.network == cli.network
+                {
+                    parsed_cli.wallet_session = std::sync::Arc::clone(&cli.wallet_session);
+                }
+
+                match dispatch(&parsed_cli).await {
+                    Ok(value) => {
+                        if *json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&value).unwrap_or_default()
+                            );
+                        } else {
+                            print_human(&parsed_cli.command, &value);
+                        }
+                    }
+                    // Printed, not returned: one bad command should not
+                    // end the session.
+                    Err(error) => eprintln!("error: {error}"),
+                }
+            }
+        }
+    }
+
+    Ok(json!({ "ok": true, "console": "closed" }))
 }
 
 /// A payment that has been built and signed, and broadcast unless previewed.
@@ -3224,11 +3735,10 @@ async fn rpa_pay_selected(
     let budget = std::time::Duration::from_secs(cli.timeout.unwrap_or(600));
     let stack = tokio::time::timeout(
         budget,
-        build_native_chain_stack(
-            selection.catalog,
-            selection.policy,
-            &cli.network.to_string(),
-            &NativeChainSecrets::default(),
+        crate::network_settings::build_stack(
+            cli.network,
+            cli.network_config_dir.as_deref(),
+            selection,
         ),
     )
     .await
@@ -3250,7 +3760,11 @@ async fn rpa_pay_selected(
     if p2p && from_height.is_none() {
         return Err(CliError::Usage("Selected P2P Cash Code funding requires --from-height with the wallet's nonzero birth height".into()));
     }
-    let policy = optn_runtime::chain::ConnectionPolicy::exact(route.source.clone(), route.protocol);
+    // Narrow to the one route; how it is reached stays the holder's choice.
+    let policy = optn_runtime::chain::ConnectionPolicy {
+        transport: service.policy().transport,
+        ..optn_runtime::chain::ConnectionPolicy::exact(route.source.clone(), route.protocol)
+    };
     let mut worker =
         hd_sync_worker(cli.network, &policy)?.with_accepted_headers(stack.headers.clone());
     service.set_policy(policy);
@@ -3524,6 +4038,95 @@ fn build_rpa_payment(
     })
 }
 
+/// `send` for a saved wallet, on the shared native stack.
+///
+/// The wallet runtime releases signing keys only after a refresh in the same
+/// session, so this refreshes through the shared HD runtime first. It then
+/// spends the runtime's own coins (ordinary HD coins; tokens never), honours
+/// every hold, sends change to a change address the runtime reserved durably,
+/// and broadcasts through the selected chain stack. A dry run plans and signs
+/// against the next change index without reserving it, and broadcasts nothing.
+#[allow(clippy::too_many_arguments)]
+async fn send_from_saved_wallet(
+    cli: &Cli,
+    to: &str,
+    destination: &Address,
+    sats: u64,
+    fee_rate: u64,
+    gap: u32,
+    max_addresses: u32,
+    dry_run: bool,
+) -> Result<Value> {
+    let synced = sync_shared_wallet(cli, gap, max_addresses, None, None, None).await?;
+    let runtime = wallet_security::open_managed_runtime(cli).await?;
+    let coins =
+        optn_runtime::wallet_spend::snapshot_spendable_coins(&synced.snapshot.value, cli.network)
+            .map_err(CliError::Protocol)?;
+    let held: std::collections::BTreeSet<String> = synced
+        .state
+        .coins
+        .iter()
+        .filter(|coin| coin.freeze().is_some())
+        .map(|coin| coin.outpoint().to_string())
+        .collect();
+    let wallet = wallet_security::read_managed_wallet(cli).await?;
+    let change_script = if dry_run {
+        let book = synced.address_book()?;
+        let next = synced
+            .state
+            .hd_addresses
+            .as_ref()
+            .map_or(0, |allocation| allocation.next_indexes()[1]);
+        let change =
+            optn_core::watch_only::address_under_account(cli.network, &book.account_xpub, 1, next)?;
+        Address::decode(&change.address)
+            .map_err(CliError::Protocol)?
+            .script_pubkey()
+    } else {
+        runtime
+            .reserve_change_outputs(1)
+            .await
+            .map_err(|error| CliError::Usage(wallet_security::message(error)))?
+            .pop()
+            .ok_or_else(|| CliError::Internal("no change output was reserved".into()))?
+    };
+    let prepared = optn_runtime::wallet_spend::prepare_spend(
+        &wallet,
+        &coins,
+        &optn_runtime::wallet_spend::SpendRequest {
+            destination_script: destination.script_pubkey(),
+            amount_sats: sats,
+            fee_per_byte: fee_rate,
+            change_script,
+            held,
+        },
+    )?;
+    if dry_run {
+        return Ok(json!({
+            "ok": true,
+            "dry_run": true,
+            "network": cli.network.to_string(),
+            "to": to,
+            "sats": sats,
+            "fee": prepared.fee_sats,
+            "change": prepared.change_sats,
+            "inputs": prepared.input_count,
+            "size_bytes": prepared.size_bytes,
+            "raw": prepared.raw_hex,
+        }));
+    }
+    let mut broadcast = broadcast_selected_chain(cli, &prepared.raw_hex).await?;
+    if let Some(result) = broadcast.as_object_mut() {
+        result.insert("to".into(), json!(to));
+        result.insert("sats".into(), json!(sats));
+        result.insert("fee".into(), json!(prepared.fee_sats));
+        result.insert("change".into(), json!(prepared.change_sats));
+        result.insert("inputs".into(), json!(prepared.input_count));
+        result.insert("spent".into(), json!(prepared.inputs));
+    }
+    Ok(broadcast)
+}
+
 /// Build, sign, and broadcast a payment out of the wallet's own coins.
 ///
 /// Shared by `send` and by x402 funding. Both need the same coin selection,
@@ -3764,9 +4367,7 @@ async fn listen(config: serve::Shared) -> Result<()> {
                         }
                     };
 
-                    // Boxed to break the recursion: `run` reaches `listen`
-                    // reaches `run`, and the future type would be infinite.
-                    match Box::pin(run(&parsed_cli)).await {
+                    match dispatch(&parsed_cli).await {
                         Ok(value) => Ok(reply(StatusCode::OK, serve::rpc_result(id, value))),
                         Err(error) => Ok(reply(
                             StatusCode::OK,
@@ -3846,6 +4447,123 @@ fn read_phrase() -> Result<String> {
 /// phrase, and stdin comes last because reaching it means blocking on input —
 /// which for a binary designed to be driven by automation is a hang, not a
 /// prompt.
+/// The wallet's coins on its first `gap` receive and change addresses, as the
+/// shared spend path takes them -- tokens included, so a plan can see every
+/// token a coin carries -- with the HD path of each coin's key.
+async fn hd_coins_with_tokens(
+    cli: &Cli,
+    client: &Client,
+    wallet: &Wallet,
+    gap: u32,
+) -> Result<(
+    optn_core::coins::CoinSet,
+    std::collections::BTreeMap<optn_core::coins::Outpoint, String>,
+)> {
+    let coin_type = default_coin_type(cli.network);
+    let mut coins = optn_core::coins::CoinSet::new();
+    let mut paths = std::collections::BTreeMap::new();
+    for change in [false, true] {
+        for index in 0..gap {
+            let path = hd::address_path(coin_type, 0, change, index);
+            let address = wallet.address(cli.network, &path)?;
+            for reported in client.utxos(&address.electrum_scripthash()).await? {
+                let outpoint =
+                    optn_core::coins::Outpoint::parse(&reported.tx_hash, reported.tx_pos)
+                        .map_err(|error| CliError::Protocol(error.to_string()))?;
+                let held = reported
+                    .token_data
+                    .as_ref()
+                    .map(|held| {
+                        token::TokenData::from_reported(
+                            &held.category,
+                            held.amount.as_deref(),
+                            held.nft.as_ref().and_then(|nft| nft.capability.as_deref()),
+                            held.nft.as_ref().and_then(|nft| nft.commitment.as_deref()),
+                        )
+                    })
+                    .transpose()?;
+                let coin = optn_core::coins::Coin::from_observation(
+                    outpoint,
+                    reported.value,
+                    address.encode(),
+                    held,
+                )
+                .map_err(|error| CliError::Protocol(error.to_string()))?;
+                coins
+                    .insert(coin)
+                    .map_err(|error| CliError::Protocol(error.to_string()))?;
+                paths.insert(outpoint, path.clone());
+            }
+        }
+    }
+    Ok((coins, paths))
+}
+
+/// Plan a token send through the shared spend path: it chooses the coins,
+/// returns every other token they carry to the wallet, pays the fee from BCH
+/// and refuses any plan that would burn a token. Change goes to the first
+/// change address, its token-aware form for tokens.
+fn plan_token_send(
+    cli: &Cli,
+    wallet: &Wallet,
+    coins: &optn_core::coins::CoinSet,
+    to: &str,
+    payment: optn_core::spend::Payment,
+    fee_sats_per_byte: u64,
+) -> Result<optn_core::spend::TokenSpendPlan> {
+    let change = wallet.address(
+        cli.network,
+        &hd::address_path(default_coin_type(cli.network), 0, true, 0),
+    )?;
+    optn_core::spend::prepare_token_spend(
+        coins,
+        cli.network,
+        &optn_core::spend::TokenSpendRequest {
+            destination: to.to_owned(),
+            payment,
+            coins: optn_core::spend::CoinChoice::Automatic,
+            change: change.encode(),
+        },
+        optn_core::fee::FeeRate::from_satoshis_per_kb(fee_sats_per_byte.saturating_mul(1000)),
+    )
+    .map_err(|error| CliError::Usage(error.to_string()))
+}
+
+/// Sign a token plan with the wallet's keys. Each signature commits to the
+/// token prefix of the output it spends, as nodes require since CashTokens;
+/// signing a token input as if it carried none gets the transaction refused.
+fn sign_token_plan(
+    wallet: &Wallet,
+    plan: &optn_core::spend::TokenSpendPlan,
+    paths: &std::collections::BTreeMap<optn_core::coins::Outpoint, String>,
+) -> Result<Vec<u8>> {
+    let mut inputs = Vec::with_capacity(plan.inputs.len());
+    let mut keys = Vec::with_capacity(plan.inputs.len());
+    for input in &plan.inputs {
+        let mut txid = input.outpoint.txid();
+        txid.reverse();
+        inputs.push(tx::Utxo {
+            txid,
+            vout: input.outpoint.vout(),
+            value: input.sats,
+            script_pubkey: Address::decode(&input.address)
+                .map_err(CliError::Usage)?
+                .script_pubkey(),
+        });
+        let path = paths.get(&input.outpoint).ok_or_else(|| {
+            CliError::Internal(format!(
+                "the plan spends {} which this wallet did not list",
+                input.outpoint
+            ))
+        })?;
+        keys.push(wallet.signing_key(path)?);
+    }
+    let outputs = plan
+        .transaction_outputs()
+        .map_err(|error| CliError::Internal(error.to_string()))?;
+    tx::Transaction::new(inputs, outputs).sign_spending_tokens(&keys, &plan.spent_tokens())
+}
+
 async fn read_wallet(cli: &Cli) -> Result<Wallet> {
     if cli.wallet.is_some() {
         return wallet_security::read_managed_wallet(cli).await;
@@ -3887,7 +4605,7 @@ fn default_coin_type(network: Network) -> u32 {
 
 /// Decode an even-length hex string.
 fn decode_hex(s: &str) -> Result<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !s.len().is_multiple_of(2) || !s.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(CliError::Usage(format!("'{s}' is not valid hex")));
     }
     (0..s.len())
@@ -4062,13 +4780,21 @@ mod header_batch_tests {
     }
 
     #[test]
-    fn electrum_hd_worker_does_not_claim_mmr() {
+    fn electrum_hd_worker_attaches_verifier_without_claiming_mmr() {
         let policy = optn_runtime::chain::ConnectionPolicy::exact(
             optn_runtime::chain::SourceId::new("cli-electrum"),
             optn_runtime::chain::ProtocolFamily::Electrum,
         );
         let worker = super::hd_sync_worker(Network::Chipnet, &policy).unwrap();
-        assert!(worker.header_verifier().is_none());
+        let verifier = worker
+            .header_verifier()
+            .expect("Chipnet Electrum attaches the shipped verifier");
+        assert!(verifier.has_difficulty_context());
+        assert_eq!(verifier.state().unwrap().height, 0);
+        let (_, mmr, header_height, _, header_evidence) = super::header_verifier_report(&worker);
+        assert!(!mmr, "genesis attach is not MMR");
+        assert_eq!(header_height, Some(0));
+        assert_eq!(header_evidence, Some("GenesisAttached"));
     }
 
     #[test]
@@ -4138,7 +4864,13 @@ fn print_human(command: &Command, v: &Value) {
             println!("scripthash  {}", s("scripthash"));
         }
         Command::X402 { action } => match action {
-            X402Command::Check { .. } => {
+            X402Command::Check(_) | X402Command::Status { .. } => {
+                println!("{}", serde_json::to_string_pretty(v).unwrap_or_default())
+            }
+            X402Command::Pay(_) => {
+                println!("{}", serde_json::to_string_pretty(v).unwrap_or_default())
+            }
+            X402Command::LegacyCheck { .. } => {
                 if v.get("payment_required").and_then(Value::as_bool) != Some(true) {
                     println!("status    {}  no payment required", n("status"));
                 } else {
@@ -4149,7 +4881,7 @@ fn print_human(command: &Command, v: &Value) {
                     println!("scheme    {}", s("scheme"));
                 }
             }
-            X402Command::Pay { .. } => {
+            X402Command::LegacyPay { .. } => {
                 if v.get("dry_run").and_then(Value::as_bool) == Some(true) {
                     println!("would pay {} sats to {}", n("sats"), s("pay_to"));
                     println!("as        {}", s("from"));
@@ -4196,6 +4928,19 @@ mod manifest_tests {
         .unwrap();
         let name = command_name(&cli.command);
         assert_eq!(name, "network select");
+        let configure =
+            Cli::try_parse_from(["optn", "network", "configure", "selection.json"]).unwrap();
+        assert_eq!(command_name(&configure.command), "network configure");
+        assert!(skills::enforce(
+            skills::Policy::parse("read").unwrap(),
+            command_name(&configure.command)
+        )
+        .is_err());
+        assert!(skills::enforce(
+            skills::Policy::parse("configure").unwrap(),
+            command_name(&configure.command)
+        )
+        .is_ok());
         assert!(skills::enforce(skills::Policy::parse("read").unwrap(), name).is_err());
         assert!(skills::enforce(skills::Policy::parse("configure").unwrap(), name).is_ok());
         assert!(skills::enforce(skills::Policy::parse("configure").unwrap(), "send").is_err());
@@ -4207,13 +4952,73 @@ mod manifest_tests {
             ("ping", 30),
             ("rescan", 300),
             ("history", 300),
+            ("tokens", 300),
             ("wallet", 300),
         ] {
             let default = Cli::try_parse_from(["optn", command]).unwrap();
-            let explicit = Cli::try_parse_from(["optn", command, "--timeout", "1"]).unwrap();
             assert_eq!(timeout_seconds(&default), seconds);
-            assert_eq!(timeout_seconds(&explicit), 1);
+            for seconds in ["0", "1", "417"] {
+                let explicit =
+                    Cli::try_parse_from(["optn", command, "--timeout", seconds]).unwrap();
+                assert_eq!(timeout_seconds(&explicit), seconds.parse::<u64>().unwrap());
+            }
         }
+    }
+
+    #[test]
+    fn tokens_report_limited_hd_coverage_and_selected_source() {
+        let mut synced = SyncedHdWallet {
+            state: optn_app::AppState {
+                network: Network::Chipnet,
+                wallet_sync: optn_app::WalletSyncView {
+                    scan_coverage: Some(optn_app::ScanCoverageView {
+                        from_height: 700_000,
+                        skipped_below: Some(700_000),
+                        chosen_by_holder: true,
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            snapshot: optn_runtime::reconciliation::ReconciledSnapshot {
+                value: optn_runtime::sync_worker::WalletNetworkSnapshot {
+                    hd: Some(optn_core::watch_only::HdAddressBook {
+                        account: hd::AccountPath::new(1, 1).unwrap(),
+                        account_xpub: "account-key-must-not-be-exported".into(),
+                        branches: Default::default(),
+                        last_used: [None; 4],
+                    }),
+                    interests: Vec::new(),
+                    transactions: Vec::new(),
+                    tip: None,
+                },
+                source: optn_runtime::chain::SourceId::new("selected-fixture"),
+                evidence: optn_runtime::chain::Evidence::ServerAssertion,
+                chain_tip: None,
+            },
+            worker: optn_runtime::sync_worker::ProgressiveSyncWorker::new(Default::default()),
+        };
+        let value = tokens_from_shared_wallet(&synced).unwrap();
+        assert_eq!(
+            value["scope"],
+            json!({"kind":"hd-account","account_path":"m/44'/1'/1'","branches":[0,1,7,2]})
+        );
+        assert_eq!(value["source"], "selected-fixture");
+        assert_eq!(value["evidence"], "ServerAssertion");
+        assert_eq!(
+            value["scan_coverage"],
+            json!({"from_height":700_000,"skipped_below":700_000,"chosen_by_holder":true})
+        );
+        assert_eq!(value["complete"], false);
+        assert!(!value
+            .to_string()
+            .contains("account-key-must-not-be-exported"));
+        assert!(value.get("transactions").is_none());
+
+        synced.state.wallet_sync.scan_coverage = None;
+        let unknown = tokens_from_shared_wallet(&synced).unwrap();
+        assert_eq!(unknown["complete"], false);
+        assert!(unknown["scan_coverage"].is_null());
     }
 
     fn command_path_exists(path: &str) -> bool {
@@ -4295,5 +5100,98 @@ mod manifest_tests {
                 skill.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod token_send_tests {
+    use super::*;
+    use optn_core::coins::{Coin, CoinSet, Outpoint};
+    use optn_core::spend::{CoinChoice, Payment, TokenSpendRequest};
+
+    /// Input `index`'s scriptSig public key, read from the raw transaction:
+    /// version, input count, then per input txid, vout, script, sequence.
+    fn signer_of(raw: &[u8], index: usize) -> Vec<u8> {
+        let mut at = 5; // version (4) + input count (1, under 0xfd here)
+        for current in 0..=index {
+            at += 36;
+            let length = usize::from(raw[at]);
+            let script = &raw[at + 1..at + 1 + length];
+            if current == index {
+                return script[script.len() - 33..].to_vec();
+            }
+            at += 1 + length + 4;
+        }
+        unreachable!()
+    }
+
+    /// The CLI's token sends are signed from the shared plan: every input by
+    /// the key of the address its own coin sits at, every token where the plan
+    /// put it. A key taken from the wrong path signs validly for nothing.
+    #[test]
+    fn a_token_plan_is_signed_with_each_coins_own_key() {
+        let wallet = Wallet::from_mnemonic(hd::BIP39_TEST_VECTOR_MNEMONIC, "").unwrap();
+        let coin_type = default_coin_type(Network::Chipnet);
+        let at = |change, index| hd::address_path(coin_type, 0, change, index);
+        let category = [7u8; 32];
+        let token_coin = Outpoint::parse(&"aa".repeat(32), 0).unwrap();
+        let bch_coin = Outpoint::parse(&"bb".repeat(32), 1).unwrap();
+        let mut coins = CoinSet::new();
+        let mut paths = std::collections::BTreeMap::new();
+        for (outpoint, path, sats, held) in [
+            (
+                token_coin,
+                at(false, 2),
+                1_000,
+                Some(token::TokenData::fungible(category, 500)),
+            ),
+            (bch_coin, at(true, 5), 50_000, None),
+        ] {
+            let address = wallet.address(Network::Chipnet, &path).unwrap();
+            coins
+                .insert(Coin::from_observation(outpoint, sats, address.encode(), held).unwrap())
+                .unwrap();
+            paths.insert(outpoint, path);
+        }
+        let mut recipient = wallet.address(Network::Chipnet, &at(false, 9)).unwrap();
+        recipient.kind = recipient.kind.token_aware();
+        let change = wallet.address(Network::Chipnet, &at(true, 0)).unwrap();
+        let plan = optn_core::spend::prepare_token_spend(
+            &coins,
+            Network::Chipnet,
+            &TokenSpendRequest {
+                destination: recipient.encode(),
+                payment: Payment::Fungible {
+                    category,
+                    amount: 200,
+                },
+                coins: CoinChoice::Automatic,
+                change: change.encode(),
+            },
+            optn_core::fee::FeeRate::from_satoshis_per_kb(1_000),
+        )
+        .unwrap();
+
+        let raw = sign_token_plan(&wallet, &plan, &paths).unwrap();
+        let decoded = tx::decode(&raw).unwrap();
+        assert_eq!(decoded.inputs.len(), plan.inputs.len());
+        for (index, input) in plan.inputs.iter().enumerate() {
+            let mut txid = decoded.inputs[index].0;
+            txid.reverse();
+            assert_eq!(Outpoint::new(txid, decoded.inputs[index].1), input.outpoint);
+            assert_eq!(
+                signer_of(&raw, index),
+                wallet.public_key(&paths[&input.outpoint]).unwrap().to_vec(),
+                "input {index} is signed by its own coin's key"
+            );
+        }
+        let tokens: Vec<_> = decoded.outputs.iter().map(|o| o.token.clone()).collect();
+        let planned: Vec<_> = plan.outputs.iter().map(|o| o.token.clone()).collect();
+        assert_eq!(tokens, planned);
+
+        // A coin the plan spends but the wallet did not list is refused.
+        let mut missing = paths.clone();
+        missing.remove(&bch_coin);
+        assert!(sign_token_plan(&wallet, &plan, &missing).is_err());
     }
 }

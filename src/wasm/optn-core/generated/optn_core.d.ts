@@ -1,6 +1,99 @@
 /* tslint:disable */
 /* eslint-disable */
 
+/**
+ * A wallet's fusion depth record.
+ */
+export class FusionDepthBook {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Add fusion txids from durable storage; returns how many were new.
+     */
+    addTxids(txids: string[]): number;
+    depthOf(outpoint: string): number;
+    /**
+     * The coins against a depth target, with Auto's two status lines, as
+     * JSON.
+     */
+    eligibility(outpoints: string[], target: number): string;
+    /**
+     * Read the stored forms; a missing or unreadable part reads as empty.
+     */
+    static fromStored(coins?: string | null, tx_depth?: string | null, txids?: string | null): FusionDepthBook;
+    fusionTxids(): string[];
+    /**
+     * Merge a cold-export record; returns `[coins taken, txids added]`.
+     */
+    importState(state: string, now_ms: number): Uint32Array;
+    isFusionTransaction(txid: string): boolean;
+    /**
+     * Fold in another window's copy; the deeper entry wins.
+     */
+    mergeStored(coins?: string | null, tx_depth?: string | null): void;
+    pruneSpent(live: string[]): boolean;
+    recordFusionTxid(txid: string): boolean;
+    recordRound(spent: string[], created: string[], now_ms: number): void;
+    storedCoins(): string;
+    storedTxDepth(): string;
+    storedTxids(): string;
+}
+
+/**
+ * Shared Rust ceiling for the legacy untrusted iframe bridge.
+ */
+export function addonLegacyGuestCallAllowed(module: string, method: string): boolean;
+
+/**
+ * A public key's P2PKH and token-aware P2PKH CashAddrs, as JSON
+ * `{publicKeyHash, address, tokenAddress}` with the hash in hex.
+ *
+ * Either SEC1 length is accepted, compressed or not, since both hash to a
+ * valid script; any other length is refused rather than hashed.
+ */
+export function bchP2pkhAddresses(network: string, public_key: Uint8Array): string;
+
+export function bcmrAuthorRegistry(request_json: string): string;
+
+export function bcmrDefaultParseBytecode(): string;
+
+export function bcmrIpfsCid(content: Uint8Array): string;
+
+export function bcmrParsableCommitment(type_byte: number, serial: number): string;
+
+export function bcmrReadPublication(locking_bytecode: Uint8Array): string | undefined;
+
+export function bcmrSequentialCommitment(number: number): string;
+
+export function bcmrSuggestIdentity(category: string, has_nfts: boolean): string;
+
+export function bcmrSymbolError(symbol: string): string | undefined;
+
+/**
+ * A new recovery phrase, drawn by the core from the browser's own
+ * `crypto.getRandomValues` (see `hd::generate_mnemonic`). JavaScript never
+ * supplies or sees the entropy, only the finished phrase.
+ */
+export function bip39GenerateMnemonic(word_count: number): string;
+
+/**
+ * Whether a phrase is valid English BIP39, written exactly as BIP39 writes it.
+ */
+export function bip39IsCanonicalMnemonic(phrase: string): boolean;
+
+/**
+ * The 64-byte BIP39 seed, for keys that are not BIP32 (MLS's HPKE inputs).
+ */
+export function bip39Seed(mnemonic: string, passphrase: string): Uint8Array;
+
+/**
+ * The coin-control label of one reported coin, as JSON; see
+ * `coin_control::ReportedCoin`. Flat arguments keep a JSON parser out of
+ * this binary.
+ */
+export function coinControlLabel(category?: string | null, amount?: string | null, nft_capability?: string | null, identity_name?: string | null, identity_ticker?: string | null, identity_decimals?: number | null, identity_status?: string | null): string;
+
 export function connectP2pkhLock(public_key: Uint8Array): Uint8Array;
 
 export function connectPublicKey(private_key: Uint8Array): Uint8Array;
@@ -38,6 +131,34 @@ export function deriveRpaKeys(mnemonic: string, passphrase: string, scan_path: s
 export function encodeCashcode(scan_pubkey: Uint8Array, spend_pubkey: Uint8Array, network: string, prefix_bits: number): string;
 
 /**
+ * A link to the holder's own explorer, from the templates they supplied.
+ */
+export function explorerCustomUrl(tx_template: string, address_template: string, network: string, kind: string, value: string, chain_policy: string): string;
+
+/**
+ * The preset used when the holder has not chosen one.
+ */
+export function explorerDefaultPresetId(): string;
+
+/**
+ * What a chain connection policy means for explorer links:
+ * `public-allowed`, `user-owned-only` or `disabled`.
+ */
+export function explorerPolicyForChainPolicy(policy: string): string;
+
+/**
+ * A link to one of the shipped public explorers, or an error explaining why
+ * the policy refuses it.
+ */
+export function explorerPresetUrl(preset_id: string, network: string, kind: string, value: string, chain_policy: string): string;
+
+/**
+ * Every shipped preset, as JSON, so the settings picker lists exactly what
+ * the router will accept.
+ */
+export function explorerPresets(): string;
+
+/**
  * Compressed one-shot nonce point published for a credential slot.
  */
 export function fusionBlindIssuerNoncePoint(nonce: Uint8Array): Uint8Array;
@@ -71,6 +192,11 @@ export function fusionBlindRequest(round_pubkey: Uint8Array, r_point: Uint8Array
 export function fusionFinalizeBlindSignature(round_pubkey: Uint8Array, r_point: Uint8Array, message: Uint8Array, a: Uint8Array, b: Uint8Array, issuer_response: Uint8Array): Uint8Array;
 
 /**
+ * `txid:vout` with the txid lower-cased (`fusion::depth::normalize_outpoint`).
+ */
+export function fusionNormalizeOutpoint(outpoint: string): string;
+
+/**
  * Check packed 65-byte uncompressed commitments against one signed amount and
  * the sum of their nonces. Malformed points fail closed.
  */
@@ -101,6 +227,16 @@ export function fusionScalarIsCanonical(bytes: Uint8Array): boolean;
  * Add packed 32-byte non-zero canonical scalars modulo the group order.
  */
 export function fusionScalarSum(packed: Uint8Array): Uint8Array;
+
+/**
+ * Choose the coins for one CashFusion round (`fusion::coin_selection`): a JSON
+ * request in, a JSON selection out, coins named by outpoint.
+ *
+ * The selection's random draws come from the host's `crypto.getRandomValues`
+ * through getrandom's `js` backend, so no caller supplies them. A host
+ * without secure randomness gets an error, never a selection.
+ */
+export function fusionSelectCoins(request_json: string): string;
 
 /**
  * Verify a 64-byte BCH Schnorr signature. False on any malformed input.
@@ -150,7 +286,73 @@ export function grindSequence(offset: number): number;
  */
 export function grindString(scan_pubkey: Uint8Array, prefix_bits: number): string;
 
+/**
+ * An xpub/tpub re-serialized with `network`'s version bytes.
+ */
+export function hdAlignPublicKeyNetwork(network: string, hd_public_key: string): string;
+
+/**
+ * The extended private key at a path: `xprv` on mainnet, `tprv` otherwise.
+ */
+export function hdExtendedPrivateKeyAtPath(mnemonic: string, passphrase: string, network: string, path: string): string;
+
+/**
+ * `private(32) || compressed public(33)` at a path, from one derivation.
+ */
+export function hdKeyPairAtPath(mnemonic: string, passphrase: string, path: string): Uint8Array;
+
+/**
+ * The 4-byte BIP32 master fingerprint.
+ */
+export function hdMasterFingerprint(mnemonic: string, passphrase: string): Uint8Array;
+
+/**
+ * The 32-byte private key at a path.
+ */
+export function hdPrivateKeyAtPath(mnemonic: string, passphrase: string, path: string): Uint8Array;
+
+/**
+ * The extended public key at a path: `xpub` on mainnet, `tpub` otherwise.
+ */
+export function hdPublicKeyAtPath(mnemonic: string, passphrase: string, network: string, path: string): string;
+
+/**
+ * The compressed public key at non-hardened child `index` of an xpub/tpub.
+ */
+export function hdPublicKeyChild(hd_public_key: string, index: number): Uint8Array;
+
 export function isLegacyPaycode(candidate: string): boolean;
+
+/**
+ * The P2 value for an address encoding. `cashaddr` is 3.
+ */
+export function ledgerAddressFormat(name: string): number;
+
+/**
+ * A BIP32 path as the Bitcoin app expects it: count byte, then big-endian
+ * u32 per level with the high bit set on hardened levels.
+ */
+export function ledgerEncodeBip32Path(path: string): Uint8Array;
+
+/**
+ * GET WALLET PUBLIC KEY, as JSON so the renderer can frame it.
+ *
+ * `format` defaults to cashaddr when empty: a Ledger asked for the app
+ * default returns a legacy address, which is a real address on the same
+ * chain that no modern Bitcoin Cash wallet displays.
+ */
+export function ledgerGetWalletPublicKey(path: string, verify: boolean, format: string): string;
+
+/**
+ * Read the device's reply. Every length is checked against what arrived, so
+ * a truncated reply is refused rather than read as a short address.
+ */
+export function ledgerParseWalletPublicKey(response: Uint8Array): string;
+
+/**
+ * A status word as something the holder can act on. Empty string is success.
+ */
+export function ledgerStatusWord(status: number): string;
 
 /**
  * The message to show for a legacy PayCode. Exported rather than duplicated
@@ -170,6 +372,35 @@ export function looksLikeRpa(candidate: string): boolean;
  * compressed.
  */
 export function paymentAddress(spend_pubkey: Uint8Array, secret: Uint8Array, network: string, index: number): string;
+
+/**
+ * Plan a send that may spend token coins, as JSON; see
+ * `spend::TokenSpendPlan`. Any wallet kind can call this: it decides inputs
+ * and outputs, token and BCH change, and checks that nothing is burned.
+ */
+export function planTokenSpend(network: string, outpoints: string[], sats: BigUint64Array, addresses: string[], categories: string[], amounts: string[], capabilities: string[], commitments: string[], payment_kind: string, payment_target: string | null | undefined, payment_amount: string | null | undefined, amount_decimals: number, chosen: string[] | null | undefined, destination: string, change: string, fee_sats_per_kb: bigint): string;
+
+/**
+ * Verify the signed return against the exact reviewed bytes. Never broadcasts.
+ */
+export function psbtFinalizeCashTokensP2pkh(original: Uint8Array, signed: Uint8Array, network: string): Uint8Array;
+
+/**
+ * Pure offline review. Does not authorize a spend or establish unspentness.
+ */
+export function psbtReviewP2pkh(raw: Uint8Array, network: string): string;
+
+/**
+ * Frame `seq_num` (from 1, without end) of a PSBT's animated
+ * `ur:crypto-psbt` QR. Stateless, so the screen owns only a counter and
+ * mobile and desktop draw the same frames.
+ */
+export function psbtUrFrame(psbt: Uint8Array, max_fragment_len: number, seq_num: number): string;
+
+/**
+ * Frames in one pass of a PSBT's animated `ur:crypto-psbt` QR.
+ */
+export function psbtUrFrameCount(psbt: Uint8Array, max_fragment_len: number): number;
 
 /**
  * `m/44'/<coin>'/<account>'/3/0` and `/3/1`, as a JSON object.
@@ -201,10 +432,50 @@ export function sharedSecret(privkey: Uint8Array, counterpart_pubkey: Uint8Array
  */
 export function spendingKey(spend_privkey: Uint8Array, secret: Uint8Array, index: number): Uint8Array;
 
+/**
+ * The label of output `vout` of the complete parent transaction `txid`
+ * (display order), as JSON. Refuses a parent that is not that transaction.
+ */
+export function spentOutputLabel(parent: Uint8Array, txid: string, vout: number): string;
+
+/**
+ * The same plan as an unsigned PSBT for an air-gapped signer, as JSON
+ * `{psbt, plan, review}`: the PSBT as hex, and Rust's review of exactly
+ * those bytes for the holder to approve.
+ *
+ * Takes the same arguments as `planTokenSpend` -- the plan is made again
+ * here, so the PSBT cannot be built from a different one -- then each coin's
+ * key (`pubkeys` as hex, empty when unknown, with its HD `branches` and
+ * `indexes`), the account path, the signer's fingerprint if the wallet has
+ * one, and the complete parent transaction of every input, as hex.
+ */
+export function tokenSpendPsbt(network: string, outpoints: string[], sats: BigUint64Array, addresses: string[], categories: string[], amounts: string[], capabilities: string[], commitments: string[], payment_kind: string, payment_target: string | null | undefined, payment_amount: string | null | undefined, amount_decimals: number, chosen: string[] | null | undefined, destination: string, change: string, fee_sats_per_kb: bigint, pubkeys: string[], branches: Uint32Array, indexes: Uint32Array, account_path: string, fingerprint: string | null | undefined, parents: string[]): string;
+
+/**
+ * Inputs of a raw transaction as JSON `{txid, vout}` records. Txids use
+ * display order, matching the shared coin-hold record. This does not sign.
+ */
+export function transactionOutpoints(raw_tx_hex: string): string;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_fusiondepthbook_free: (a: number, b: number) => void;
+    readonly addonLegacyGuestCallAllowed: (a: number, b: number, c: number, d: number) => number;
+    readonly bchP2pkhAddresses: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly bcmrAuthorRegistry: (a: number, b: number) => [number, number, number, number];
+    readonly bcmrDefaultParseBytecode: () => [number, number];
+    readonly bcmrIpfsCid: (a: number, b: number) => [number, number];
+    readonly bcmrParsableCommitment: (a: number, b: number) => [number, number, number, number];
+    readonly bcmrReadPublication: (a: number, b: number) => [number, number];
+    readonly bcmrSequentialCommitment: (a: number) => [number, number, number, number];
+    readonly bcmrSuggestIdentity: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly bcmrSymbolError: (a: number, b: number) => [number, number];
+    readonly bip39GenerateMnemonic: (a: number) => [number, number, number, number];
+    readonly bip39IsCanonicalMnemonic: (a: number, b: number) => number;
+    readonly bip39Seed: (a: number, b: number, c: number, d: number) => any;
+    readonly coinControlLabel: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
     readonly connectP2pkhLock: (a: number, b: number) => [number, number, number, number];
     readonly connectPublicKey: (a: number, b: number) => [number, number, number, number];
     readonly connectSignInput: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
@@ -213,36 +484,80 @@ export interface InitOutput {
     readonly decodeCashcode: (a: number, b: number) => [number, number, number, number];
     readonly deriveRpaKeys: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
     readonly encodeCashcode: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
+    readonly explorerCustomUrl: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
+    readonly explorerDefaultPresetId: () => [number, number];
+    readonly explorerPolicyForChainPolicy: (a: number, b: number) => [number, number];
+    readonly explorerPresetUrl: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number, number];
+    readonly explorerPresets: () => [number, number];
     readonly fusionBlindIssuerNoncePoint: (a: number, b: number) => [number, number, number, number];
     readonly fusionBlindIssuerPublicKey: (a: number, b: number) => [number, number, number, number];
     readonly fusionBlindIssuerSign: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly fusionBlindRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number, number];
     readonly fusionFinalizeBlindSignature: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number, number];
+    readonly fusionNormalizeOutpoint: (a: number, b: number) => [number, number];
     readonly fusionPedersenBalanceHolds: (a: number, b: number, c: bigint, d: number, e: number) => [number, number, number];
     readonly fusionPedersenCommit: (a: bigint, b: number, c: number) => [number, number, number, number];
     readonly fusionPedersenCommitSigned: (a: bigint, b: number, c: number) => [number, number, number, number];
     readonly fusionPedersenH: () => [number, number];
     readonly fusionScalarIsCanonical: (a: number, b: number) => number;
     readonly fusionScalarSum: (a: number, b: number) => [number, number, number, number];
+    readonly fusionSelectCoins: (a: number, b: number) => [number, number, number, number];
     readonly fusionVerifySchnorr: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
+    readonly fusiondepthbook_addTxids: (a: number, b: number, c: number) => number;
+    readonly fusiondepthbook_depthOf: (a: number, b: number, c: number) => number;
+    readonly fusiondepthbook_eligibility: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly fusiondepthbook_fromStored: (a: number, b: number, c: number, d: number, e: number, f: number) => number;
+    readonly fusiondepthbook_fusionTxids: (a: number) => [number, number];
+    readonly fusiondepthbook_importState: (a: number, b: number, c: number, d: number) => [number, number];
+    readonly fusiondepthbook_isFusionTransaction: (a: number, b: number, c: number) => number;
+    readonly fusiondepthbook_mergeStored: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly fusiondepthbook_pruneSpent: (a: number, b: number, c: number) => number;
+    readonly fusiondepthbook_recordFusionTxid: (a: number, b: number, c: number) => number;
+    readonly fusiondepthbook_recordRound: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly fusiondepthbook_storedCoins: (a: number) => [number, number];
+    readonly fusiondepthbook_storedTxDepth: (a: number) => [number, number];
+    readonly fusiondepthbook_storedTxids: (a: number) => [number, number];
     readonly grindBudget: (a: number) => [number, number, number];
     readonly grindRpaTransaction: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number) => [number, number, number, number];
     readonly grindSequence: (a: number) => [number, number, number];
     readonly grindString: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly hdAlignPublicKeyNetwork: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly hdExtendedPrivateKeyAtPath: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
+    readonly hdKeyPairAtPath: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
+    readonly hdMasterFingerprint: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly hdPrivateKeyAtPath: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
+    readonly hdPublicKeyAtPath: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
+    readonly hdPublicKeyChild: (a: number, b: number, c: number) => [number, number, number, number];
     readonly isLegacyPaycode: (a: number, b: number) => number;
+    readonly ledgerAddressFormat: (a: number, b: number) => [number, number, number];
+    readonly ledgerEncodeBip32Path: (a: number, b: number) => [number, number, number, number];
+    readonly ledgerGetWalletPublicKey: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly ledgerParseWalletPublicKey: (a: number, b: number) => [number, number, number, number];
+    readonly ledgerStatusWord: (a: number) => [number, number];
     readonly legacyPaycodeRejection: () => [number, number];
     readonly looksLikeRpa: (a: number, b: number) => number;
     readonly paymentAddress: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
+    readonly planTokenSpend: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number, b1: number, c1: number, d1: bigint) => [number, number, number, number];
+    readonly psbtFinalizeCashTokensP2pkh: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly psbtReviewP2pkh: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly psbtUrFrame: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly psbtUrFrameCount: (a: number, b: number, c: number) => [number, number, number];
     readonly rpaKeyPaths: (a: number, b: number) => [number, number];
     readonly scanTransaction: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number, number];
     readonly sendBlockReason: (a: number, b: number) => [number, number, number, number];
     readonly sharedSecret: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number, number];
     readonly spendingKey: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
-    readonly __wbindgen_externrefs: WebAssembly.Table;
+    readonly spentOutputLabel: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
+    readonly tokenSpendPsbt: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number, z: number, a1: number, b1: number, c1: number, d1: bigint, e1: number, f1: number, g1: number, h1: number, i1: number, j1: number, k1: number, l1: number, m1: number, n1: number, o1: number, p1: number) => [number, number, number, number];
+    readonly transactionOutpoints: (a: number, b: number) => [number, number, number, number];
     readonly __wbindgen_malloc: (a: number, b: number) => number;
+    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_exn_store: (a: number) => void;
+    readonly __externref_table_alloc: () => number;
+    readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+    readonly __externref_drop_slice: (a: number, b: number) => void;
     readonly __wbindgen_start: () => void;
 }
 

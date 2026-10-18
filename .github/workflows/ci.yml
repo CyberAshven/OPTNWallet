@@ -2,9 +2,7 @@ name: CI
 on:
   pull_request:
   push:
-    # Pull requests cover dev/staging. Keep the full post-merge check on main
-    # without running the same suite again for every promotion push.
-    branches: [main]
+    branches: [main, staging, dev]
     paths-ignore:
       - 'docs/**'
       - '**/*.md'
@@ -71,9 +69,62 @@ jobs:
           echo "Dependency graph: $status (HTTP ${code})"
           echo "status=$status" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # GitHub keeps hand-submitted dependency snapshots forever. When the base
+      # commit carries one and the head has only GitHub's own static graph, the
+      # comparison is incomplete: the snapshot's packages read as removed, and
+      # changes go unreviewed. That comparison is never the only one trusted.
+      # Starting at the base, walk back to the nearest ancestor whose comparison
+      # with the head is complete. The review then runs from both, so nothing
+      # this pull request adds escapes either: the real base catches packages it
+      # re-adds, and the complete base catches everything the graph could not
+      # see. With no complete ancestor within 20 commits, the job still fails.
+      # Only the review steps read its output, and they need the graph, so it
+      # is gated the same way: with the graph off, the compare API answers 403.
+      - name: Choose a base with a complete dependency graph
+        id: review-base
+        if: steps.dependency-graph.outputs.status == 'enabled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          headers="$(mktemp)"
+          trap 'rm -f "$headers"' EXIT
+          base="$BASE_SHA"
+          for _ in $(seq 20); do
+            curl --fail --silent --show-error --retry 3 --retry-all-errors --retry-delay 2 \
+              --dump-header "$headers" --output /dev/null \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/dependency-graph/compare/$base...$HEAD_SHA?per_page=5"
+            warning="$(awk 'tolower($1) == "x-github-dependency-graph-snapshot-warnings:" { sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\r/, ""); value = $0 } END { print value }' "$headers")"
+            if [[ -z "$warning" ]]; then
+              if [[ "$base" == "$BASE_SHA" ]]; then
+                echo "Dependency graph has complete snapshots for the PR base and head."
+              else
+                echo "::notice::The PR base carries dependency snapshots its head lacks; also reviewing from ancestor $base, whose comparison is complete and covers this pull request's changes and more."
+              fi
+              echo "sha=$base" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            detail="$(printf '%s' "$warning" | base64 --decode 2>/dev/null || true)"
+            echo "::warning::Comparison from $base is incomplete: ${detail:-$warning}"
+            base="$(gh api "repos/$GITHUB_REPOSITORY/commits/$base" --jq '.parents[0].sha')"
+            [[ "$base" =~ ^[0-9a-f]{40}$ ]] || break
+          done
+          echo "::error::No ancestor of $BASE_SHA within 20 commits has a complete dependency comparison with $HEAD_SHA"
+          exit 1
       - name: Dependency review
         if: steps.dependency-graph.outputs.status == 'enabled'
         uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48
+      - name: Dependency review from the complete base
+        if: steps.dependency-graph.outputs.status == 'enabled' && steps.review-base.outputs.sha != github.event.pull_request.base.sha
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48
+        with:
+          base-ref: ${{ steps.review-base.outputs.sha }}
+          head-ref: ${{ github.event.pull_request.head.sha }}
       - name: Skip dependency review
         if: steps.dependency-graph.outputs.status != 'enabled'
         run: echo "Dependency graph is disabled; skipping dependency review."
@@ -117,6 +168,8 @@ jobs:
 
       - name: Dependency policy
         run: npm run deps:check
+      - name: Dependency security regressions
+        run: npx vitest run scripts/__tests__/dependencySecurity.test.mts
       - name: Dependency audit (prod, critical+)
         run: npm audit --omit=dev --audit-level=critical
       - name: Dependency audit (all, high+)
@@ -125,33 +178,15 @@ jobs:
   web-ci:
     needs: [secrets-scan, dependency-audit]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      - name: Canonical quality gate
+        uses: ./.github/actions/quality-gate
         with:
           node-version: '22.23.2'
-          cache: npm
-
-      - name: Install deps
-        run: npm ci
-
-      - name: Unit tests
-        run: npm run test:core
-
-      - name: App tests
-        run: npm run test:apps
-
-      - name: UI tests
-        run: npm run test:ui
-
-      - name: Addon manifest validation
-        run: npm run addons:validate
-
-      - name: Build web (sanity)
-        run: npm run build
+          run-build: 'true'
 
       - name: Upload web dist
         if: github.event_name == 'push' && always()

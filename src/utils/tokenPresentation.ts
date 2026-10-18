@@ -79,7 +79,9 @@ export function formatAtomicTokenAmount(
   if (!/^\d+$/.test(unsigned)) return '0';
 
   if (unsigned.length <= normalizedDecimals) {
-    const fractional = unsigned.padStart(normalizedDecimals, '0').replace(/0+$/, '');
+    const fractional = unsigned
+      .padStart(normalizedDecimals, '0')
+      .replace(/0+$/, '');
     return `${isNegative ? '-' : ''}0${fractional ? `.${fractional}` : ''}`;
   }
 
@@ -118,9 +120,14 @@ export function resolveTokenPresentation(
     | 'iconUri'
     | 'snapshot'
     | 'isRefreshing'
+    | 'identityStatus'
+    | 'identityAssurance'
+    | 'identityFinal'
   > | null,
   fallback?: TokenPresentationFallback | null
 ): TokenPresentation {
+  // Legacy UTXO/cache metadata cannot override a scoped runtime observation.
+  if (metadata?.identityStatus) fallback = null;
   const normalizedCategory = String(category ?? '').trim();
   const shortCategory = shortTokenCategory(normalizedCategory);
   const hasSnapshot = Boolean(metadata?.snapshot);
@@ -146,19 +153,27 @@ export function resolveTokenPresentation(
   const decimals = hasSnapshot
     ? pickNumber(metadata?.decimals, fallbackDecimals)
     : fallbackDecimals;
-  const iconUri = hasSnapshot
-    ? pickString(metadata?.iconUri, fallbackIconUri) || null
-    : fallbackIconUri || null;
+  // A runtime identity shows only an image the host fetched under the wallet's
+  // transport policy; a URI there would make the webview contact its host.
+  const iconUri = metadata?.identityStatus
+    ? metadata.iconUri?.startsWith('data:image/')
+      ? metadata.iconUri
+      : null
+    : hasSnapshot
+      ? pickString(metadata?.iconUri, fallbackIconUri) || null
+      : fallbackIconUri || null;
 
   const primaryLabel = pickString(name, symbol, shortCategory);
-  const secondaryLabel =
-    name && symbol && name !== symbol ? symbol : null;
+  const secondaryLabel = name && symbol && name !== symbol ? symbol : null;
 
   const shouldShowStatus =
+    Boolean(metadata?.identityStatus) ||
     metadata?.status === 'loading' ||
     metadata?.isRefreshing === true ||
     metadata?.freshness === 'refreshing';
-  const statusLabel = shouldShowStatus ? getBcmrMetadataStatusLabel(metadata) : null;
+  const statusLabel = shouldShowStatus
+    ? getBcmrMetadataStatusLabel(metadata)
+    : null;
   const statusTone: TokenPresentationStatusTone | null = shouldShowStatus
     ? getBcmrMetadataStatusTone(metadata)
     : null;

@@ -1,11 +1,9 @@
 // src/components/transaction/ErrorAndStatusPopups.tsx
 
 import React, { useMemo } from 'react';
-import { useSelector } from 'react-redux';
 import Popup from './Popup';
 import { Network } from '../../../state/slices/networkSlice';
-import { selectExplorerChoice } from '../../../state/slices/preferencesSlice';
-import { buildTxUrl } from '../../../utils/servers/explorers';
+import ExplorerLink from '../../../components/ExplorerLink';
 import {
   binToHex,
   decodeTransactionCommon,
@@ -23,6 +21,7 @@ import { type BroadcastState } from '../../../services/TransactionService';
 import { useI18n } from '../../../i18n/useI18n';
 import { copyToClipboard } from '../../../utils/clipboard';
 
+import { cashAddressPrefix, parseNetwork } from '../../../utils/networkProfile';
 interface ErrorAndStatusPopupsProps {
   showRawTxPopup: boolean;
   showTxIdPopup: boolean;
@@ -45,11 +44,8 @@ const ErrorAndStatusPopups: React.FC<ErrorAndStatusPopupsProps> = ({
   closePopups,
 }) => {
   const { t } = useI18n();
-  const explorerChoice = useSelector(selectExplorerChoice);
-  const prefixLength =
-    currentNetwork === Network.MAINNET
-      ? PREFIX.mainnet.length
-      : PREFIX.chipnet.length;
+  const network = parseNetwork(currentNetwork) ?? Network.MAINNET;
+  const prefixLength = PREFIX[network].length;
   const toCashAddress = (
     bytecode: Uint8Array,
     prefix: 'bitcoincash' | 'bchtest' | 'bchreg'
@@ -177,9 +173,7 @@ const ErrorAndStatusPopups: React.FC<ErrorAndStatusPopupsProps> = ({
                               {shortenTxHash(
                                 toCashAddress(
                                   lockingBytecode,
-                                  currentNetwork === Network.MAINNET
-                                    ? 'bitcoincash'
-                                    : 'bchtest'
+                                  cashAddressPrefix(network)
                                 ),
                                 prefixLength
                               )}
@@ -269,20 +263,12 @@ const ErrorAndStatusPopups: React.FC<ErrorAndStatusPopupsProps> = ({
                 📋
               </button>
             </div>
-            <a
-              href={buildTxUrl(
-                explorerChoice,
-                currentNetwork === Network.CHIPNET
-                  ? Network.CHIPNET
-                  : Network.MAINNET,
-                transactionId
-              )}
-              target="_blank"
-              rel="noopener noreferrer"
+            <ExplorerLink
+              network={network}
+              txid={transactionId}
               className="wallet-btn-primary py-2 px-4"
-            >
-              {t('builder.viewExplorer')}
-            </a>
+              label={t('builder.viewExplorer')}
+            />
           </div>
         </Popup>
       )}

@@ -5,17 +5,25 @@
 //! route. Route-local prerequisites (BIP37/Neutrino header cursors) stay on the
 //! same endpoint via `ChainService::execute_on_route`.
 
-use crate::chain::{BlockHeaderBytes, ProtocolFamily, SourceId};
+use crate::chain::{BlockHeaderBytes, Hash32, ProtocolFamily, SourceId};
 use crate::chain_service::{
     CapabilityRoute, ChainOperation, ChainPayload, ChainRequest, ChainService, ChainServiceError,
     ChainTip, ObservedTransaction, WalletInterest,
 };
-use crate::header_store::{HeaderStoreError, SharedHeaders};
-use crate::header_verifier::{ShvMmrError, ShvMmrHeaderVerifier};
+use crate::header_recovery::{AcceptedCommitment, HistoricalReplay, ReplayBudget, ReplayStep};
+#[cfg(test)]
+use crate::header_store::BlockHeaderSource;
+use crate::header_store::{HeaderStoreError, HeaderStoreRevision, RetainedHeaders, SharedHeaders};
+use crate::header_verifier::{shipped_header_verifier, ShvMmrError, ShvMmrHeaderVerifier};
 use crate::header_view::{HeaderViewError, VerifiedHeaderView};
 use crate::reconciliation::{evidence_strength, ReconciliationDecision, ReconciliationState};
+use crate::wallet_checkpoint::StoredHeaderProgress;
+use optn_core::header_hash::sha256d;
 use optn_core::network::Network;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+mod historical;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletNetworkSnapshot {
@@ -312,6 +320,17 @@ pub struct ProgressiveSyncConfig {
     pub header_batch_size: u32,
     /// Safety bound against a malicious peer that never terminates header sync.
     pub max_header_batches: u32,
+    /// Stop a header pass after this many newly verified headers and keep them.
+    ///
+    /// `None` walks until the peer returns a short batch (BIP37/Neutrino need
+    /// the verified tip). Electrum wallet evidence stays a server assertion, so
+    /// a single real batch is enough to advance the MMR without walking the
+    /// whole chain on every refresh.
+    pub max_verified_headers_per_pass: Option<u32>,
+    /// Recent full headers retained after a durable wallet sync. Ordinary
+    /// peers keep older locator hashes; SHV-capable BIP37 routes can recover
+    /// those hashes on demand and retain only this window.
+    pub retained_header_window: u32,
 }
 
 impl Default for ProgressiveSyncConfig {
@@ -320,6 +339,8 @@ impl Default for ProgressiveSyncConfig {
             header_start_height: 1,
             header_batch_size: 2_000,
             max_header_batches: 1_000,
+            max_verified_headers_per_pass: None,
+            retained_header_window: 2_016,
         }
     }
 }
@@ -343,6 +364,8 @@ pub enum ProgressiveSyncError {
     InconsistentRefreshScope,
     HeaderVerification(ShvMmrError),
     HeaderView(HeaderViewError),
+    HeaderRecovery(String),
+    MissingAcceptedHeaderStore,
     /// Accepted headers did not join the dense store they were destined for.
     ///
     /// The view and the store are one accepted chain; if they disagree about
@@ -352,6 +375,28 @@ pub enum ProgressiveSyncError {
     Chain(ChainServiceError),
     UnexpectedPayload,
     Exhausted,
+    /// A source's chain leaves this one deeper than the reorg window. BCHN
+    /// finalizes a block ten deep and will not reorg past it; neither does
+    /// this wallet.
+    ReorgBeyondWindow {
+        floor: u32,
+    },
+    /// A source's branch does not carry more work than the blocks it would
+    /// replace, so this chain stays.
+    ReorgWithLessWork {
+        fork: u32,
+    },
+}
+
+/// Restore the sealed header view against the checkpoint carried by the same
+/// authenticated wallet record. The blob supplies only public replay hints;
+/// the checkpoint remains the trust boundary.
+pub fn restore_header_progress(
+    network: Network,
+    progress: &StoredHeaderProgress,
+) -> Result<VerifiedHeaderView, ProgressiveSyncError> {
+    VerifiedHeaderView::restore(&progress.view, network, &progress.trusted)
+        .map_err(ProgressiveSyncError::HeaderView)
 }
 
 /// What a refresh is asking a provider for.
@@ -408,7 +453,15 @@ pub struct ProgressiveSyncWorker {
     /// run, so a host that verifies headers but never publishes them has a
     /// wallet that cannot sync.
     accepted: Option<Arc<SharedHeaders>>,
+    /// A route that supplied a proof authenticated by this worker. Mere SHV
+    /// advertisement never authorizes dropping the compatibility hash index.
+    proven_shv_route: Option<CapabilityRoute>,
 }
+
+/// A restored checkpoint is public progress, so a current chain may require a
+/// full historical replay before the dense scan store can be repopulated. Keep
+/// that work finite while covering the shipped Chipnet and mainnet heights.
+const MAX_HISTORICAL_REPLAY_HEADERS: u32 = 2_000_000;
 
 impl ProgressiveSyncWorker {
     pub fn new(config: ProgressiveSyncConfig) -> Self {
@@ -417,6 +470,7 @@ impl ProgressiveSyncWorker {
             reconciliation: ReconciliationState::default(),
             header_view: None,
             accepted: None,
+            proven_shv_route: None,
         }
     }
 
@@ -461,6 +515,15 @@ impl ProgressiveSyncWorker {
         }
         self.header_view = Some(view);
         Ok(self)
+    }
+
+    /// Attach the durable header view a wallet sealed previously.
+    pub fn with_stored_header_progress(
+        self,
+        network: Network,
+        progress: &StoredHeaderProgress,
+    ) -> Result<Self, ProgressiveSyncError> {
+        self.with_header_view(restore_header_progress(network, progress)?)
     }
 
     pub fn header_view(&self) -> Option<&VerifiedHeaderView> {
@@ -544,11 +607,20 @@ impl ProgressiveSyncWorker {
         }
 
         for route in routes {
-            if matches!(
+            // BIP37 and Neutrino snapshots must match the verified header tip,
+            // so their headers come first. An Electrum (or other server-
+            // asserted) snapshot is never tied to the header view: its headers
+            // follow, best-effort, and a header fault or reorg cannot keep the
+            // wallet from loading.
+            let headers_first = matches!(
                 route.protocol,
                 ProtocolFamily::Bip37 | ProtocolFamily::Neutrino
-            ) {
-                if let Err(error) = self.prime_headers_on_same_route(service, &route).await {
+            );
+            if headers_first && self.header_view.is_some() {
+                if let Err(error) = self
+                    .prime_headers_for_scope(service, &route, from_height)
+                    .await
+                {
                     self.reconciliation
                         .record_failure(format!("header prerequisite failed: {error:?}"));
                     continue;
@@ -625,13 +697,63 @@ impl ProgressiveSyncWorker {
                         transactions,
                         tip,
                     };
-                    let decision = self.reconciliation.reconcile_candidate(
+                    let primes_after = !headers_first && self.header_view.is_some();
+                    // A weaker snapshot at a tip the headers do not hold yet may
+                    // be vouched for once this route's headers are primed below:
+                    // keep a copy for that one retry.
+                    let retry = (primes_after
+                        && self
+                            .reconciliation
+                            .authoritative
+                            .as_ref()
+                            .is_some_and(|current| {
+                                evidence_strength(&evidence) < evidence_strength(&current.evidence)
+                            }))
+                    .then(|| {
+                        (
+                            snapshot.clone(),
+                            observation.source.clone(),
+                            evidence.clone(),
+                        )
+                    });
+                    let mut decision = self.reconciliation.reconcile_refresh(
                         snapshot,
                         observation.source,
                         evidence,
                         observation.chain_tip,
-                        true,
+                        |tip| {
+                            self.header_view
+                                .as_ref()
+                                .is_some_and(|view| view.holds(tip))
+                        },
                     );
+                    if primes_after {
+                        let primed = self
+                            .prime_headers_for_scope(service, &route, from_height)
+                            .await;
+                        if let (ReconciliationDecision::PreservedWeakerEvidence, Some(retry)) =
+                            (&decision, retry)
+                        {
+                            let (snapshot, source, evidence) = retry;
+                            decision = self.reconciliation.reconcile_refresh(
+                                snapshot,
+                                source,
+                                evidence,
+                                observation.chain_tip,
+                                |tip| {
+                                    self.header_view
+                                        .as_ref()
+                                        .is_some_and(|view| view.holds(tip))
+                                },
+                            );
+                        }
+                        if let Err(error) = primed {
+                            if decision == ReconciliationDecision::Accepted {
+                                self.reconciliation
+                                    .note_degraded(format!("headers did not advance: {error:?}"));
+                            }
+                        }
+                    }
                     return Ok(SyncOutcome { route, decision });
                 }
                 Err(error) => {
@@ -648,14 +770,34 @@ impl ProgressiveSyncWorker {
         service: &mut ChainService,
         wallet_route: &CapabilityRoute,
     ) -> Result<(), ProgressiveSyncError> {
-        // Verify each batch before publishing it. P2P getheaders needs the
-        // accepted hash of the preceding batch as its next locator. A later
-        // failure leaves both authorities at the last fully verified batch;
-        // it never marks wallet history fresh or accepts the failed batch.
+        self.prime_headers_for_scope(service, wallet_route, None)
+            .await
+    }
+
+    async fn prime_headers_for_scope(
+        &mut self,
+        service: &mut ChainService,
+        wallet_route: &CapabilityRoute,
+        floor: Option<u32>,
+    ) -> Result<(), ProgressiveSyncError> {
+        self.restore_historical_store_on_same_route(service, wallet_route, floor)
+            .await?;
+        // Work on a candidate so a failed route cannot poison another route's
+        // trusted cursor. Publish only after the complete bounded header pass.
         let mut view = self
             .header_view
             .clone()
             .ok_or(ProgressiveSyncError::MissingTrustedHeaderVerifier)?;
+        let snapshot = self
+            .accepted
+            .as_ref()
+            .map(|store| {
+                let (revision, result) = store.snapshot(|retained| {
+                    historical::reauthenticate_time_windows(&mut view, retained)
+                });
+                result.map(|()| revision)
+            })
+            .transpose()?;
         let header_route = service
             .routes_for_operation(ChainOperation::HeaderSync)
             .into_iter()
@@ -676,6 +818,18 @@ impl ProgressiveSyncWorker {
             .height
             .checked_add(1)
             .ok_or(ProgressiveSyncError::HeaderSafetyLimit)?;
+        let mut staged: Vec<(u32, BlockHeaderBytes)> = Vec::new();
+        let mut advanced = 0u32;
+        // Set once this pass has rolled back to a fork: the fork height and the
+        // blocks the rollback orphaned, which the new branch must outweigh.
+        let mut reorg: Option<(u32, Vec<BlockHeaderBytes>)> = None;
+        let pass_limit = if wallet_route.protocol == ProtocolFamily::Electrum {
+            self.config
+                .max_verified_headers_per_pass
+                .or(Some(self.config.header_batch_size.max(1)))
+        } else {
+            self.config.max_verified_headers_per_pass
+        };
         for _ in 0..self.config.max_header_batches {
             let request = ChainRequest::HeaderSync {
                 start_height: start,
@@ -698,30 +852,216 @@ impl ProgressiveSyncWorker {
                 return Err(ProgressiveSyncError::InvalidHeaderRange);
             }
             if headers.is_empty() {
-                return Ok(());
+                return self.finish_header_pass(view, staged, snapshot.as_ref(), service, reorg);
             }
             let returned = u32::try_from(headers.len())
                 .map_err(|_| ProgressiveSyncError::HeaderSafetyLimit)?;
             let batch: Vec<BlockHeaderBytes> = headers.into_iter().map(BlockHeaderBytes).collect();
+            if advanced == 0 && reorg.is_none() {
+                let parent: Hash32 = batch[0].0[4..36]
+                    .try_into()
+                    .expect("an 80-byte header holds its parent");
+                if view.tip().is_some_and(|(_, tip)| tip != parent) {
+                    // The source's next block does not build on this chain's
+                    // tip: its chain left this one. Find where, roll back to a
+                    // state this view really had there, and continue from it.
+                    Self::seed_missing_ring(
+                        service,
+                        &header_route,
+                        &mut view,
+                        self.config.header_batch_size.max(1),
+                    )
+                    .await?;
+                    let fork = Self::find_fork(service, &header_route, &view).await?;
+                    reorg = Some((fork, view.ring_headers_above(fork)));
+                    view.rollback_to(fork)
+                        .map_err(ProgressiveSyncError::HeaderView)?;
+                    start = fork
+                        .checked_add(1)
+                        .ok_or(ProgressiveSyncError::HeaderSafetyLimit)?;
+                    continue;
+                }
+            }
             view.extend(&batch)
                 .map_err(ProgressiveSyncError::HeaderView)?;
-            let staged = batch
-                .into_iter()
-                .enumerate()
-                .map(|(offset, header)| (start_height + offset as u32, header))
-                .collect();
-            self.publish_headers(view.clone(), staged)?;
+            // Held rather than written: a later batch in this pass can still
+            // fail, and a half-advanced store is a chain nobody verified.
+            staged.extend(
+                batch
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, header)| (start_height + offset as u32, header)),
+            );
             start = start_height
                 .checked_add(returned)
                 .ok_or(ProgressiveSyncError::HeaderSafetyLimit)?;
-            if returned < self.config.header_batch_size.max(1) {
-                return Ok(());
+            advanced = advanced
+                .checked_add(returned)
+                .ok_or(ProgressiveSyncError::HeaderSafetyLimit)?;
+            // After a rollback the pass runs until the source has no more, so the
+            // new branch is weighed whole against what it replaces, never cut
+            // short by the per-pass limit.
+            if returned < self.config.header_batch_size.max(1)
+                || (reorg.is_none() && pass_limit.is_some_and(|limit| advanced >= limit))
+            {
+                return self.finish_header_pass(view, staged, snapshot.as_ref(), service, reorg);
             }
         }
         Err(ProgressiveSyncError::HeaderSafetyLimit)
     }
 
-    /// Commit one bounded verified batch: the verified view and the dense store
+    /// One block of reorg ring for a view that has none.
+    ///
+    /// A view restored from a record written before rings were kept, and not
+    /// extended since, cannot step back even one block, so an orphaned tip
+    /// would hold it behind the chain for good: found live on chipnet, where a
+    /// one-block orphan at 325,540 stopped every wallet's headers there. The
+    /// state one block back comes from the tip's own proof and the few headers
+    /// under its parent, and the view authenticates those itself
+    /// ([`ShvMmrHeaderVerifier::parent`]); the source is trusted for nothing.
+    /// A parent needing more than `max_headers` blocks under it is left to
+    /// the refusal [`Self::find_fork`] gives.
+    async fn seed_missing_ring(
+        service: &mut ChainService,
+        route: &CapabilityRoute,
+        view: &mut VerifiedHeaderView,
+        max_headers: u32,
+    ) -> Result<(), ProgressiveSyncError> {
+        let Some((tip, _)) = view.tip() else {
+            return Ok(());
+        };
+        if view.rollback_floor().is_some_and(|floor| floor < tip) {
+            return Ok(());
+        }
+        let Some(count) = view
+            .verifier()
+            .headers_below_parent()
+            .and_then(|below| below.checked_add(1))
+            .filter(|count| *count <= max_headers)
+        else {
+            return Ok(());
+        };
+        let start = tip - count;
+        let observation = service
+            .execute_on_route(
+                route,
+                &ChainRequest::HeaderSync {
+                    start_height: start,
+                    count,
+                },
+            )
+            .await
+            .map_err(ProgressiveSyncError::Chain)?;
+        let ChainPayload::Headers {
+            start_height,
+            headers,
+        } = observation.value
+        else {
+            return Err(ProgressiveSyncError::UnexpectedPayload);
+        };
+        if start_height != start || headers.len() != count as usize {
+            return Err(ProgressiveSyncError::InvalidHeaderRange);
+        }
+        let headers: Vec<BlockHeaderBytes> = headers.into_iter().map(BlockHeaderBytes).collect();
+        let (parent, below) = headers
+            .split_last()
+            .expect("at least the parent was requested");
+        let parent = view
+            .verifier()
+            .parent(parent, below)
+            .map_err(ProgressiveSyncError::HeaderVerification)?;
+        view.seed_ring(parent)
+            .map_err(ProgressiveSyncError::HeaderView)?;
+        Ok(())
+    }
+
+    /// Where `route`'s chain leaves this view's: the highest block both
+    /// have, found within the reorg ring in one request.
+    async fn find_fork(
+        service: &mut ChainService,
+        route: &CapabilityRoute,
+        view: &VerifiedHeaderView,
+    ) -> Result<u32, ProgressiveSyncError> {
+        let (tip, _) = view
+            .tip()
+            .ok_or(ProgressiveSyncError::MissingTrustedHeaderVerifier)?;
+        let floor = view
+            .rollback_floor()
+            .filter(|floor| *floor < tip)
+            .ok_or(ProgressiveSyncError::ReorgBeyondWindow { floor: tip })?;
+        let observation = service
+            .execute_on_route(
+                route,
+                &ChainRequest::HeaderSync {
+                    start_height: floor + 1,
+                    count: tip - floor,
+                },
+            )
+            .await
+            .map_err(ProgressiveSyncError::Chain)?;
+        let ChainPayload::Headers {
+            start_height,
+            headers,
+        } = observation.value
+        else {
+            return Err(ProgressiveSyncError::UnexpectedPayload);
+        };
+        if start_height != floor + 1 || headers.len() > (tip - floor) as usize {
+            return Err(ProgressiveSyncError::InvalidHeaderRange);
+        }
+        for (offset, header) in headers.into_iter().enumerate() {
+            let parent = floor + offset as u32;
+            if view.ring_hash_at(parent).as_ref().map(|hash| &hash[..]) != Some(&header[4..36]) {
+                // Its first block does not build on the oldest one the ring
+                // holds: the chains part below the window.
+                return Err(if offset == 0 {
+                    ProgressiveSyncError::ReorgBeyondWindow { floor }
+                } else {
+                    ProgressiveSyncError::InvalidHeaderRange
+                });
+            }
+            let hash = crate::header_verifier::header_leaf(&BlockHeaderBytes(header));
+            if view.ring_hash_at(parent + 1) != Some(hash) {
+                return Ok(parent);
+            }
+        }
+        Err(ProgressiveSyncError::HeaderRecovery(
+            "the source's next block does not build on this chain, though its recent blocks are this chain's"
+                .into(),
+        ))
+    }
+
+    /// Publish a header pass. After a reorg, only if the new branch carries
+    /// more work than the blocks it replaces: otherwise this chain stays and
+    /// nothing is written.
+    fn finish_header_pass(
+        &mut self,
+        view: VerifiedHeaderView,
+        staged: Vec<(u32, BlockHeaderBytes)>,
+        snapshot: Option<&HeaderStoreRevision>,
+        service: &ChainService,
+        reorg: Option<(u32, Vec<BlockHeaderBytes>)>,
+    ) -> Result<(), ProgressiveSyncError> {
+        let bits = |header: &BlockHeaderBytes| {
+            u32::from_le_bytes(header.0[72..76].try_into().expect("an 80-byte header"))
+        };
+        let rewind_from = match reorg {
+            None => None,
+            Some((fork, orphaned)) => {
+                let replacing: Vec<u32> = staged.iter().map(|(_, header)| bits(header)).collect();
+                let orphaned: Vec<u32> = orphaned.iter().map(bits).collect();
+                if !optn_core::header_pow::more_work(&replacing, &orphaned).map_err(|error| {
+                    ProgressiveSyncError::HeaderVerification(ShvMmrError::Header(error))
+                })? {
+                    return Err(ProgressiveSyncError::ReorgWithLessWork { fork });
+                }
+                Some(fork + 1)
+            }
+        };
+        self.publish_headers(view, staged, snapshot, service, rewind_from)
+    }
+
+    /// Commit one bounded header pass: the verified view and the dense store
     /// advance together, or neither does.
     ///
     /// The join is checked before anything is written, so a batch that does not
@@ -732,28 +1072,372 @@ impl ProgressiveSyncWorker {
         &mut self,
         view: VerifiedHeaderView,
         staged: Vec<(u32, BlockHeaderBytes)>,
+        snapshot: Option<&HeaderStoreRevision>,
+        service: &ChainService,
+        rewind_from: Option<u32>,
     ) -> Result<(), ProgressiveSyncError> {
+        if service.revocation().is_revoked() {
+            return Err(ProgressiveSyncError::HeaderRecovery(
+                "source changed during header acquisition".into(),
+            ));
+        }
         if let Some(store) = self.accepted.as_ref() {
+            let snapshot = snapshot.ok_or_else(|| {
+                ProgressiveSyncError::HeaderRecovery("missing accepted-store snapshot".into())
+            })?;
+            let mut candidate = RetainedHeaders::new();
+            for (height, header) in staged {
+                historical::insert_recovered(&mut candidate, height, header)?;
+            }
             store
-                .write(|retained| {
-                    if let Some((height, header)) = staged.first() {
-                        if let Some(parent) = height
-                            .checked_sub(1)
-                            .and_then(|before| retained.hash_at(before))
-                        {
-                            if header.0[4..36] != parent {
-                                return Err(HeaderStoreError::Linkage { height: *height });
-                            }
+                .write_if_current(snapshot, |retained| {
+                    if service.revocation().is_revoked() {
+                        return Err(ProgressiveSyncError::HeaderRecovery(
+                            "accepted headers or source changed during header acquisition".into(),
+                        ));
+                    }
+                    let may_publish = || !service.revocation().is_revoked();
+                    match rewind_from {
+                        None => retained
+                            .merge_verified(candidate, may_publish)
+                            .map_err(ProgressiveSyncError::HeaderStore),
+                        // A reorg replaces the orphaned blocks, bumping the
+                        // store's generation so anything read from them is
+                        // stale. On a copy, so a failed join changes nothing.
+                        Some(height) => {
+                            let mut next = retained.clone();
+                            next.rewind_to(height);
+                            next.merge_verified(candidate, may_publish)
+                                .map_err(ProgressiveSyncError::HeaderStore)?;
+                            *retained = next;
+                            Ok(())
                         }
                     }
-                    for (height, header) in staged {
-                        retained.insert_verified(height, header)?;
-                    }
-                    Ok(())
                 })
-                .map_err(ProgressiveSyncError::HeaderStore)?;
+                .ok_or_else(|| {
+                    ProgressiveSyncError::HeaderRecovery(
+                        "accepted headers changed during header acquisition".into(),
+                    )
+                })??;
         }
         self.header_view = Some(view);
+        Ok(())
+    }
+
+    /// Rebuild the dense accepted-header prefix when a sealed view was restored
+    /// into a fresh native store. P2P providers need those hashes for their
+    /// locators and block ranges; restoring only the MMR cursor leaves them
+    /// unable to scan the wallet's historical floor.
+    async fn restore_historical_store_on_same_route(
+        &mut self,
+        service: &mut ChainService,
+        wallet_route: &CapabilityRoute,
+        floor: Option<u32>,
+    ) -> Result<(), ProgressiveSyncError> {
+        if !matches!(
+            wallet_route.protocol,
+            ProtocolFamily::Bip37 | ProtocolFamily::Neutrino
+        ) {
+            return Ok(());
+        }
+        let Some(view) = self.header_view.clone() else {
+            return Err(ProgressiveSyncError::MissingTrustedHeaderVerifier);
+        };
+        let target = view.checkpoint();
+        if target.height == 0 {
+            return Ok(());
+        }
+        let Some(store) = self.accepted.clone() else {
+            // Framework-neutral callers may carry only the verified view. A
+            // connected native P2P host must attach its provider-visible store
+            // to exercise historical recovery; without one there is no shared
+            // store this method could safely publish into.
+            return Ok(());
+        };
+        let target_hash = view.tip().map(|(_, hash)| hash).ok_or_else(|| {
+            ProgressiveSyncError::HeaderRecovery("restored view has no tip".into())
+        })?;
+        // BIP37 needs its requested scan range and a recent retention window.
+        // Neutrino also builds filter-header commitments from genesis, so it
+        // still needs earlier block hashes even for a recent wallet birthday.
+        let start = if wallet_route.protocol == ProtocolFamily::Bip37 {
+            floor.unwrap_or(0).saturating_sub(1).min(
+                target
+                    .height
+                    .saturating_sub(self.config.retained_header_window.max(1) - 1),
+            )
+        } else {
+            0
+        };
+        if store.read(|retained| {
+            retained.covers_range(start, target.height)
+                && retained.hash_at(target.height) == Some(target_hash)
+                && (floor.is_some() || !historical::missing_time_windows(&view, retained))
+        }) {
+            return Ok(());
+        }
+
+        // Keep the fallback bound to the store that existed before the proof
+        // attempt too. A failed proof cannot hide an intervening store write.
+        let (snapshot, accepted_genesis) = store.snapshot(|retained| retained.hash_at(0));
+        if self
+            .restore_with_shv(service, wallet_route, &view, &store, start)
+            .await?
+        {
+            return Ok(());
+        }
+
+        let header_route = service
+            .routes_for_operation(ChainOperation::HeaderSync)
+            .into_iter()
+            .find(|candidate| {
+                candidate.source == wallet_route.source
+                    && candidate.protocol == wallet_route.protocol
+                    && candidate.endpoint == wallet_route.endpoint
+            })
+            .ok_or_else(|| ProgressiveSyncError::MissingHeaderRoute {
+                source: wallet_route.source.clone(),
+                protocol: wallet_route.protocol,
+            })?;
+        let anchors = view
+            .times()
+            .anchors()
+            .iter()
+            .filter(|anchor| anchor.height < target.height && anchor.is_authenticated())
+            .map(|anchor| (anchor.height, anchor.block_hash))
+            .collect::<BTreeMap<_, _>>();
+        let batch_size = self.config.header_batch_size.max(1);
+        let required_headers = target
+            .height
+            .checked_add(1)
+            .ok_or(ProgressiveSyncError::HeaderSafetyLimit)?;
+        if required_headers > MAX_HISTORICAL_REPLAY_HEADERS {
+            return Err(ProgressiveSyncError::HeaderSafetyLimit);
+        }
+        let max_batches = target.height.saturating_add(batch_size.saturating_sub(1)) / batch_size;
+        let budget = ReplayBudget {
+            max_headers: required_headers,
+            max_batches: max_batches.saturating_add(1),
+        };
+        let mut replay = HistoricalReplay::begin(
+            view.network(),
+            AcceptedCommitment {
+                height: target.height,
+                commitment: target.commitment,
+            },
+            anchors,
+            budget,
+        )
+        .map_err(|error| ProgressiveSyncError::HeaderRecovery(format!("begin: {error:?}")))?;
+
+        // The replay starts at leaf zero, while getheaders starts after a
+        // locator. Genesis is shipped chain identity and is fed locally; every
+        // network batch then names the previous hash from this private store.
+        let genesis_verifier = shipped_header_verifier(view.network()).map_err(|error| {
+            ProgressiveSyncError::HeaderRecovery(format!("genesis verifier: {error:?}"))
+        })?;
+        let genesis = genesis_verifier
+            .tip_checkpoint_proof()
+            .map(|(header, _)| header.clone())
+            .ok_or_else(|| {
+                ProgressiveSyncError::HeaderRecovery("missing shipped genesis header".into())
+            })?;
+        let genesis_hash = sha256d(&genesis.0);
+        if accepted_genesis.is_some_and(|hash| hash != genesis_hash) {
+            return Err(ProgressiveSyncError::HeaderRecovery(
+                "accepted store has a different network genesis".into(),
+            ));
+        }
+        let mut staged = RetainedHeaders::new();
+        staged
+            .insert_verified(0, genesis.clone())
+            .map_err(ProgressiveSyncError::HeaderStore)?;
+        match replay.feed(std::slice::from_ref(&genesis)) {
+            ReplayStep::NeedHeaders { from_height: 1 } => {}
+            step => {
+                return Err(ProgressiveSyncError::HeaderRecovery(format!(
+                    "genesis replay did not advance: {step:?}"
+                )))
+            }
+        }
+
+        self.replay_headers_into_store(
+            service,
+            &header_route,
+            &mut staged,
+            replay,
+            target.height,
+            max_batches,
+        )
+        .await?;
+        if !staged.covers_range(0, target.height)
+            || staged.hash_at(target.height) != Some(target_hash)
+        {
+            return Err(ProgressiveSyncError::HeaderRecovery(
+                "staged headers do not end at the restored tip".into(),
+            ));
+        }
+
+        // No accepted-store reader can observe a replay batch. Commit the
+        // complete authenticated candidate under one write lock, and refuse
+        // to overwrite a concurrent runtime update made while replay ran.
+        store
+            .write_if_current(&snapshot, |retained| {
+                if service.revocation().is_revoked() {
+                    return Err(ProgressiveSyncError::HeaderRecovery(
+                        "accepted store changed during historical replay".into(),
+                    ));
+                }
+                retained
+                    .merge_verified(staged, || !service.revocation().is_revoked())
+                    .map_err(ProgressiveSyncError::HeaderStore)
+            })
+            .ok_or_else(|| {
+                ProgressiveSyncError::HeaderRecovery(
+                    "accepted store changed during historical replay".into(),
+                )
+            })?
+    }
+
+    async fn replay_headers_into_store(
+        &self,
+        service: &mut ChainService,
+        header_route: &CapabilityRoute,
+        store: &mut RetainedHeaders,
+        mut replay: HistoricalReplay,
+        target_height: u32,
+        max_batches: u32,
+    ) -> Result<(), ProgressiveSyncError> {
+        let batch_size = self.config.header_batch_size.max(1);
+        for _ in 0..max_batches {
+            let start = replay.next_height();
+            if start == 0 {
+                return Err(ProgressiveSyncError::HeaderSafetyLimit);
+            }
+            let locator = start
+                .checked_sub(1)
+                .and_then(|height| store.hash_at(height))
+                .ok_or_else(|| {
+                    ProgressiveSyncError::HeaderRecovery(format!(
+                        "staged store has no locator at {}",
+                        start.saturating_sub(1)
+                    ))
+                })?;
+            let observation = service
+                .execute_on_route(
+                    header_route,
+                    &ChainRequest::HeaderSyncFromLocator {
+                        start_height: start,
+                        count: batch_size,
+                        locator,
+                    },
+                )
+                .await
+                .map_err(ProgressiveSyncError::Chain)?;
+            let ChainPayload::Headers {
+                start_height,
+                headers,
+            } = observation.value
+            else {
+                return Err(ProgressiveSyncError::UnexpectedPayload);
+            };
+            if start_height != start || headers.len() > batch_size as usize {
+                return Err(ProgressiveSyncError::InvalidHeaderRange);
+            }
+            let batch = headers
+                .into_iter()
+                .map(BlockHeaderBytes)
+                .collect::<Vec<_>>();
+            let step = replay.feed(&batch);
+            let consumed = match &step {
+                ReplayStep::NeedHeaders { from_height } => from_height.saturating_sub(start),
+                ReplayStep::Authenticated { through_height, .. } => {
+                    through_height.saturating_sub(start).saturating_add(1)
+                }
+                ReplayStep::Incomplete(reason) => reason.next_height().saturating_sub(start),
+                ReplayStep::Diverged(_) => 0,
+            };
+            let consumed =
+                usize::try_from(consumed).map_err(|_| ProgressiveSyncError::HeaderSafetyLimit)?;
+            if consumed > batch.len() {
+                return Err(ProgressiveSyncError::InvalidHeaderRange);
+            }
+            if consumed > 0 {
+                self.publish_recovered_headers(store, start, &batch, consumed)?;
+            }
+            match step {
+                ReplayStep::NeedHeaders { from_height } if from_height > start => {}
+                ReplayStep::Authenticated { .. } => {
+                    if !store.covers_range(0, target_height) {
+                        return Err(ProgressiveSyncError::InvalidHeaderRange);
+                    }
+                    return Ok(());
+                }
+                ReplayStep::NeedHeaders { .. } => {
+                    return Err(ProgressiveSyncError::HeaderRecovery(
+                        "replay cursor did not advance".into(),
+                    ));
+                }
+                ReplayStep::Incomplete(reason) => {
+                    return Err(ProgressiveSyncError::HeaderRecovery(format!(
+                        "incomplete: {reason:?}"
+                    )));
+                }
+                ReplayStep::Diverged(reason) => {
+                    return Err(ProgressiveSyncError::HeaderRecovery(format!(
+                        "diverged: {reason:?}"
+                    )));
+                }
+            }
+        }
+        Err(ProgressiveSyncError::HeaderSafetyLimit)
+    }
+
+    fn publish_recovered_headers(
+        &self,
+        store: &mut RetainedHeaders,
+        start: u32,
+        batch: &[BlockHeaderBytes],
+        count: usize,
+    ) -> Result<(), ProgressiveSyncError> {
+        if start == 0 || store.hash_at(start - 1).is_none() {
+            return Err(ProgressiveSyncError::HeaderStore(
+                HeaderStoreError::Linkage { height: start },
+            ));
+        }
+        for (offset, header) in batch.iter().take(count).enumerate() {
+            let height = start
+                .checked_add(offset as u32)
+                .ok_or(ProgressiveSyncError::HeaderSafetyLimit)?;
+            let hash = sha256d(&header.0);
+            if store
+                .hash_at(height)
+                .is_some_and(|existing| existing != hash)
+            {
+                return Err(ProgressiveSyncError::HeaderStore(
+                    HeaderStoreError::Linkage { height },
+                ));
+            }
+            if let Some(next_height) = height.checked_add(1) {
+                if let Some(next) = store.header_at(next_height) {
+                    if next.0[4..36] != hash {
+                        return Err(ProgressiveSyncError::HeaderStore(
+                            HeaderStoreError::Linkage {
+                                height: next_height,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        for (offset, header) in batch.iter().take(count).enumerate() {
+            let height = start
+                .checked_add(offset as u32)
+                .ok_or(ProgressiveSyncError::HeaderSafetyLimit)?;
+            store
+                .insert_verified(height, header.clone())
+                .map_err(ProgressiveSyncError::HeaderStore)?;
+        }
         Ok(())
     }
 }
@@ -769,8 +1453,21 @@ pub(crate) mod tests {
         ConnectionPolicy, Endpoint, EndpointKind, Evidence, ProviderHealth, SourceCatalog,
         SourceDisposition, SourceOrigin,
     };
-    use crate::chain_service::{BackendObservation, ChainBackend, ChainFuture};
+    use crate::chain_service::{BackendObservation, ChainBackend, ChainBackendError, ChainFuture};
     use std::sync::Arc;
+
+    #[derive(Default)]
+    struct HeaderProbe {
+        requests: Vec<ChainRequest>,
+        spans: Vec<Option<(u32, u32)>>,
+        reject_published_during_replay: bool,
+        /// Every header and wallet request, in the order they arrived.
+        sequence: Vec<&'static str>,
+        /// The tip the wallet answer reports, when not the default.
+        wallet_tip: Option<(u32, Hash32)>,
+    }
+
+    type HeaderProbeHandle = (Arc<SharedHeaders>, Arc<std::sync::Mutex<HeaderProbe>>);
 
     struct WalletBackend {
         id: SourceId,
@@ -782,7 +1479,7 @@ pub(crate) mod tests {
         wallet_evidence: Evidence,
         /// Every floor this backend was asked to scan from, in order.
         asked_from: Arc<std::sync::Mutex<Vec<Option<u32>>>>,
-        locator_store: Option<Arc<SharedHeaders>>,
+        probe: Option<HeaderProbeHandle>,
     }
     impl ChainBackend for WalletBackend {
         fn source_id(&self) -> &SourceId {
@@ -808,21 +1505,36 @@ pub(crate) mod tests {
         }
         fn execute<'a>(&'a self, request: &'a ChainRequest) -> ChainFuture<'a, BackendObservation> {
             Box::pin(async move {
+                if matches!(
+                    request,
+                    ChainRequest::HeaderSync { .. } | ChainRequest::HeaderSyncFromLocator { .. }
+                ) {
+                    if let Some((store, probe)) = &self.probe {
+                        let span = store.retained_span();
+                        let mut probe = probe.lock().expect("header probe");
+                        if probe.reject_published_during_replay
+                            && matches!(request, ChainRequest::HeaderSyncFromLocator { .. })
+                            && span != Some((0, 0))
+                        {
+                            return Err(ChainBackendError::Rejected(
+                                "shared store was published before replay authentication".into(),
+                            ));
+                        }
+                        probe.requests.push(request.clone());
+                        probe.spans.push(span);
+                        probe.sequence.push("headers");
+                    }
+                }
                 if let ChainRequest::HeaderSync {
                     start_height,
                     count,
+                }
+                | ChainRequest::HeaderSyncFromLocator {
+                    start_height,
+                    count,
+                    ..
                 } = request
                 {
-                    if *start_height > 1 {
-                        if let Some(store) = &self.locator_store {
-                            use crate::header_store::BlockHeaderSource;
-                            if store.hash_at(start_height - 1).is_none() {
-                                return Err(crate::chain_service::ChainBackendError::Rejected(
-                                    "previous batch is not available as an accepted locator".into(),
-                                ));
-                            }
-                        }
-                    }
                     return Ok(BackendObservation {
                         payload: ChainPayload::Headers {
                             start_height: start_height + self.header_height_offset,
@@ -843,17 +1555,22 @@ pub(crate) mod tests {
                         .lock()
                         .expect("floor recorder")
                         .push(*from_height);
+                    if let Some((_, probe)) = &self.probe {
+                        probe.lock().expect("header probe").sequence.push("wallet");
+                    }
                 }
+                let (height, hash) = self
+                    .probe
+                    .as_ref()
+                    .and_then(|(_, probe)| probe.lock().expect("header probe").wallet_tip)
+                    .unwrap_or((7, [7; 32]));
                 Ok(BackendObservation {
                     payload: ChainPayload::WalletRefresh {
                         transactions: vec![],
-                        tip: Some(ChainTip {
-                            height: 7,
-                            hash: [7; 32],
-                        }),
+                        tip: Some(ChainTip { height, hash }),
                     },
                     evidence: self.wallet_evidence.clone(),
-                    chain_tip: Some((7, [7; 32])),
+                    chain_tip: Some((height, hash)),
                 })
             })
         }
@@ -868,22 +1585,6 @@ pub(crate) mod tests {
         headers: Vec<[u8; 80]>,
         header_height_offset: u32,
         wallet_evidence: Evidence,
-    ) -> ChainService {
-        service_with_header_locator(
-            protocol,
-            headers,
-            header_height_offset,
-            wallet_evidence,
-            None,
-        )
-    }
-
-    fn service_with_header_locator(
-        protocol: ProtocolFamily,
-        headers: Vec<[u8; 80]>,
-        header_height_offset: u32,
-        wallet_evidence: Evidence,
-        locator_store: Option<Arc<SharedHeaders>>,
     ) -> ChainService {
         let id = SourceId::new("server");
         let endpoint = Endpoint {
@@ -928,7 +1629,62 @@ pub(crate) mod tests {
             header_height_offset,
             wallet_evidence,
             asked_from: Arc::new(std::sync::Mutex::new(Vec::new())),
-            locator_store,
+            probe: None,
+        }));
+        service
+    }
+
+    fn service_with_headers_probe(
+        protocol: ProtocolFamily,
+        headers: Vec<[u8; 80]>,
+        header_height_offset: u32,
+        wallet_evidence: Evidence,
+        probe: Option<HeaderProbeHandle>,
+    ) -> ChainService {
+        let id = SourceId::new("probe-server");
+        let endpoint = Endpoint {
+            kind: if protocol == ProtocolFamily::Electrum {
+                EndpointKind::ElectrumTcp
+            } else {
+                EndpointKind::BchP2p
+            },
+            host: "probe-server".into(),
+            port: Some(50002),
+        };
+        let mut catalog = SourceCatalog::default();
+        catalog
+            .insert(ChainSource {
+                id: id.clone(),
+                label: "probe-server".into(),
+                origin: SourceOrigin::UserAdded,
+                endpoints: vec![endpoint.clone()],
+                capabilities: CapabilitySet::default(),
+                disposition: SourceDisposition::Enabled,
+                priority: 0,
+            })
+            .unwrap();
+        let mut caps = CapabilitySet::default();
+        caps.record(
+            Capability::UtxoQuery,
+            CapabilityConfidence::Verified,
+            CapabilityDiscovery::ActiveProbe,
+        );
+        caps.record(
+            Capability::HeaderStream,
+            CapabilityConfidence::Verified,
+            CapabilityDiscovery::ActiveProbe,
+        );
+        let mut service = ChainService::new(catalog, ConnectionPolicy::auto());
+        service.register(Arc::new(WalletBackend {
+            id,
+            endpoint,
+            caps,
+            protocol,
+            headers,
+            header_height_offset,
+            wallet_evidence,
+            asked_from: Arc::new(std::sync::Mutex::new(Vec::new())),
+            probe,
         }));
         service
     }
@@ -977,7 +1733,7 @@ pub(crate) mod tests {
             header_height_offset: 0,
             wallet_evidence: Evidence::ServerAssertion,
             asked_from: asked_from.clone(),
-            locator_store: None,
+            probe: None,
         }));
         (service, asked_from)
     }
@@ -988,6 +1744,9 @@ pub(crate) mod tests {
         header_fixture_to(2)
     }
 
+    /// The same chain, carried to an arbitrary height. Cash Code discovery
+    /// scans a block range rather than a pair, so its tests need more than
+    /// three headers from the one fixture that already proves the wiring.
     pub(crate) fn header_fixture_to(end: u32) -> (ShvMmrHeaderVerifier, Vec<[u8; 80]>) {
         use optn_core::asert::{next_bits, AsertAnchor, AsertParams};
         use optn_core::header_pow::verify_declared_pow;
@@ -1001,6 +1760,7 @@ pub(crate) mod tests {
             height: 0,
             bits: params.max_bits,
             prev_time: 0,
+            successor_hash: None,
         };
         let mut previous_hash = [0; 32];
         let mut headers = Vec::new();
@@ -1040,6 +1800,48 @@ pub(crate) mod tests {
         (verifier, headers)
     }
 
+    fn shipped_regtest_view_to(end: u32) -> (VerifiedHeaderView, Vec<[u8; 80]>, [u8; 32]) {
+        use optn_core::asert::AsertParams;
+        use optn_core::header_pow::verify_declared_pow;
+
+        let verifier = shipped_header_verifier(Network::Regtest).expect("regtest genesis");
+        let genesis = verifier.last_hash().expect("regtest genesis hash");
+        let genesis_time = verifier.last_time().expect("regtest genesis time");
+        let params = AsertParams::for_network(Network::Regtest);
+        let mut previous = genesis;
+        let mut headers = Vec::new();
+        for height in 1..=end {
+            let mut header = [0u8; 80];
+            header[0..4].copy_from_slice(&1u32.to_le_bytes());
+            header[4..36].copy_from_slice(&previous);
+            header[36..68].copy_from_slice(&[height as u8; 32]);
+            header[68..72]
+                .copy_from_slice(&genesis_time.saturating_add(height * 600).to_le_bytes());
+            header[72..76].copy_from_slice(&params.max_bits.to_le_bytes());
+            let mut found = false;
+            for nonce in 0u32..100_000 {
+                header[76..80].copy_from_slice(&nonce.to_le_bytes());
+                if let Ok(parsed) = verify_declared_pow(&header) {
+                    previous = parsed.hash;
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "regtest fixture header must satisfy proof of work");
+            headers.push(header);
+        }
+        let mut view = VerifiedHeaderView::new(Network::Regtest, verifier);
+        view.extend(
+            &headers
+                .iter()
+                .copied()
+                .map(BlockHeaderBytes)
+                .collect::<Vec<_>>(),
+        )
+        .expect("regtest fixture extension");
+        (view, headers, genesis)
+    }
+
     #[tokio::test]
     async fn header_pass_verifies_multiple_batches_and_keeps_cursor_on_rejection() {
         for protocol in [ProtocolFamily::Bip37, ProtocolFamily::Neutrino] {
@@ -1054,10 +1856,7 @@ pub(crate) mod tests {
                         .collect::<Vec<_>>(),
                 )
                 .unwrap();
-            let mut accepted_prefix = verifier.clone();
-            accepted_prefix
-                .extend(&[BlockHeaderBytes(headers[0])])
-                .unwrap();
+            let initial = verifier.state().unwrap();
             let (tip_header, tip_proof) = expected.tip_checkpoint_proof().unwrap();
             let checkpoint = expected.checkpoint();
             let restored = ShvMmrHeaderVerifier::from_checkpoint_proof(
@@ -1114,7 +1913,7 @@ pub(crate) mod tests {
                 .is_err());
             assert_eq!(
                 rejected.header_verifier().unwrap().state().unwrap(),
-                accepted_prefix.state().unwrap()
+                initial
             );
 
             let mut gap_service =
@@ -1127,7 +1926,7 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 rejected.header_verifier().unwrap().state().unwrap(),
-                accepted_prefix.state().unwrap()
+                initial
             );
 
             // This backend advertises wallet tip 7 even though only headers
@@ -1138,6 +1937,294 @@ pub(crate) mod tests {
             );
             assert!(worker.reconciliation().authoritative.is_none());
         }
+    }
+
+    /// A worker verified to height 2 and a provider whose headers continue
+    /// to height 4: numbered correctly, or one off so every batch is refused.
+    fn header_order_fixture(
+        protocol: ProtocolFamily,
+        misnumbered: bool,
+    ) -> (
+        ProgressiveSyncWorker,
+        ChainService,
+        Arc<std::sync::Mutex<HeaderProbe>>,
+        VerifiedHeaderView,
+    ) {
+        let (view, _, _) = shipped_regtest_view_to(2);
+        let (_, headers, genesis) = shipped_regtest_view_to(4);
+        let store = Arc::new(SharedHeaders::default());
+        store.write(|retained| retained.insert_hash_only(0, genesis));
+        let probe = Arc::new(std::sync::Mutex::new(HeaderProbe::default()));
+        let service = service_with_headers_probe(
+            protocol,
+            headers,
+            u32::from(misnumbered),
+            Evidence::ServerAssertion,
+            Some((store, probe.clone())),
+        );
+        let worker = ProgressiveSyncWorker::new(ProgressiveSyncConfig::default())
+            .with_header_view(view.clone())
+            .unwrap();
+        (worker, service, probe, view)
+    }
+
+    /// An Electrum snapshot is server-asserted and never tied to the header
+    /// view, so a header fault (a reorg, a bad batch) must not keep the wallet
+    /// from loading. Its headers follow, and their failure is only noted.
+    #[tokio::test]
+    async fn electrum_wallet_data_does_not_wait_for_headers() {
+        let (mut worker, mut service, probe, view) =
+            header_order_fixture(ProtocolFamily::Electrum, true);
+        let outcome = worker.refresh(&mut service, vec![], None).await.unwrap();
+        assert_eq!(outcome.decision, ReconciliationDecision::Accepted);
+        let reconciliation = worker.reconciliation();
+        assert_eq!(
+            reconciliation.authoritative.as_ref().unwrap().evidence,
+            Evidence::ServerAssertion
+        );
+        assert!(reconciliation.sync.history_fresh && reconciliation.sync.utxos_fresh);
+        assert!(reconciliation
+            .sync
+            .degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("headers did not advance")));
+        assert_eq!(worker.header_view().unwrap().tip(), view.tip());
+        assert_eq!(
+            probe.lock().unwrap().sequence.first(),
+            Some(&"wallet"),
+            "the wallet is asked before the headers"
+        );
+
+        // With good headers the view still advances, after the wallet.
+        let (mut worker, mut service, probe, view) =
+            header_order_fixture(ProtocolFamily::Electrum, false);
+        let outcome = worker.refresh(&mut service, vec![], None).await.unwrap();
+        assert_eq!(outcome.decision, ReconciliationDecision::Accepted);
+        assert!(worker.reconciliation().sync.degraded_reason.is_none());
+        assert!(worker.header_view().unwrap().tip().unwrap().0 > view.tip().unwrap().0);
+        let sequence = probe.lock().unwrap().sequence.clone();
+        assert_eq!(sequence.first(), Some(&"wallet"));
+        assert!(sequence.contains(&"headers"));
+    }
+
+    /// A holder's stronger (BIP37) snapshot is retained when they move to
+    /// Electrum. The server's weaker snapshot is taken once the headers
+    /// primed on its route hold its newer tip, labelled as lowered; until
+    /// they do, the stronger snapshot stays.
+    #[tokio::test]
+    async fn a_weaker_source_advances_the_wallet_only_to_a_verified_tip() {
+        for headers_fail in [false, true] {
+            let (mut worker, mut service, probe, view) =
+                header_order_fixture(ProtocolFamily::Electrum, headers_fail);
+            let (_, headers, _) = shipped_regtest_view_to(4);
+            let newer = (4, optn_core::header_hash::sha256d(&headers[3]));
+            probe.lock().unwrap().wallet_tip = Some(newer);
+            let (height, hash) = view.tip().unwrap();
+            worker.reconciliation_mut().reconcile_candidate(
+                WalletNetworkSnapshot {
+                    hd: None,
+                    interests: vec![],
+                    transactions: vec![],
+                    tip: Some(ChainTip { height, hash }),
+                },
+                SourceId::new("peer"),
+                Evidence::HeaderMmrProven {
+                    block_hash: hash,
+                    height,
+                },
+                Some((height, hash)),
+                true,
+            );
+            assert!(
+                !view.holds(newer),
+                "the wallet answer is ahead of the headers"
+            );
+
+            let outcome = worker.refresh(&mut service, vec![], None).await.unwrap();
+            let reconciliation = worker.reconciliation();
+            let snapshot = reconciliation.authoritative.as_ref().unwrap();
+            if headers_fail {
+                assert_eq!(
+                    outcome.decision,
+                    ReconciliationDecision::PreservedWeakerEvidence
+                );
+                assert_eq!(snapshot.chain_tip, Some((height, hash)));
+                assert!(matches!(
+                    snapshot.evidence,
+                    Evidence::HeaderMmrProven { .. }
+                ));
+            } else {
+                assert_eq!(outcome.decision, ReconciliationDecision::Accepted);
+                assert!(worker.header_view().unwrap().holds(newer));
+                assert_eq!(snapshot.chain_tip, Some(newer));
+                assert_eq!(snapshot.evidence, Evidence::ServerAssertion);
+                assert_eq!(
+                    reconciliation.sync.degraded_reason.as_deref(),
+                    Some("evidence lowered from header-proven to server-reported at a newer verified tip")
+                );
+            }
+        }
+    }
+
+    /// A BIP37 snapshot must match the verified tip, so its headers still
+    /// come first and their failure still refuses the route.
+    #[tokio::test]
+    async fn bip37_wallet_data_still_waits_for_verified_headers() {
+        let (mut worker, mut service, probe, view) =
+            header_order_fixture(ProtocolFamily::Bip37, true);
+        assert_eq!(
+            worker.refresh(&mut service, vec![], None).await,
+            Err(ProgressiveSyncError::Exhausted)
+        );
+        assert!(worker.reconciliation().authoritative.is_none());
+        assert!(worker
+            .reconciliation()
+            .sync
+            .degraded_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("header prerequisite failed")));
+        assert_eq!(worker.header_view().unwrap().tip(), view.tip());
+        let sequence = probe.lock().unwrap().sequence.clone();
+        assert_eq!(sequence.first(), Some(&"headers"));
+        assert!(
+            !sequence.contains(&"wallet"),
+            "no wallet query before verified headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_p2p_replay_stages_locators_until_one_authenticated_commit() {
+        let (view, headers, genesis) = shipped_regtest_view_to(4);
+
+        let store = Arc::new(SharedHeaders::default());
+        store.write(|retained| retained.insert_hash_only(0, genesis));
+        let probe = Arc::new(std::sync::Mutex::new(HeaderProbe {
+            reject_published_during_replay: true,
+            ..Default::default()
+        }));
+        let mut service = service_with_headers_probe(
+            ProtocolFamily::Bip37,
+            headers.clone(),
+            0,
+            Evidence::ServerAssertion,
+            Some((store.clone(), probe.clone())),
+        );
+        let route = service
+            .routes_for_operation(ChainOperation::WalletRefresh)
+            .remove(0);
+        let mut worker = ProgressiveSyncWorker::new(ProgressiveSyncConfig {
+            header_batch_size: 1,
+            ..Default::default()
+        })
+        .with_header_view(view)
+        .expect("restored view");
+        worker = worker.with_accepted_headers(store.clone());
+
+        worker
+            .restore_historical_store_on_same_route(&mut service, &route, None)
+            .await
+            .expect("authenticated replay commits the dense store");
+
+        let probe = probe.lock().expect("header probe");
+        assert_eq!(
+            probe.spans,
+            vec![Some((0, 0)); 4],
+            "a provider-side concurrent reader must see only genesis until proof completes"
+        );
+        let mut expected_locator = genesis;
+        for (index, request) in probe.requests.iter().enumerate() {
+            let ChainRequest::HeaderSyncFromLocator {
+                start_height,
+                locator,
+                ..
+            } = request
+            else {
+                panic!("historical replay used a non-staged header request")
+            };
+            assert_eq!(*start_height, index as u32 + 1);
+            assert_eq!(*locator, expected_locator);
+            expected_locator =
+                crate::header_verifier::header_leaf(&BlockHeaderBytes(headers[index]));
+        }
+        assert_eq!(store.retained_span(), Some((0, 4)));
+        assert_eq!(store.hash_at(4), Some(expected_locator));
+    }
+
+    #[tokio::test]
+    async fn electrum_primes_a_real_header_batch_and_keeps_server_assertion_wallet_evidence() {
+        let (verifier, headers) = header_fixture();
+        let genesis_height = verifier.state().unwrap().height;
+        assert_eq!(genesis_height, 0);
+        let config = ProgressiveSyncConfig {
+            header_batch_size: 1,
+            max_verified_headers_per_pass: Some(2),
+            ..Default::default()
+        };
+        let mut worker = ProgressiveSyncWorker::new(config)
+            .with_header_verifier(Network::Chipnet, verifier)
+            .unwrap();
+        let mut service = service_with_headers(
+            ProtocolFamily::Electrum,
+            headers,
+            0,
+            Evidence::ServerAssertion,
+        );
+        let outcome = worker
+            .refresh(&mut service, vec![], None)
+            .await
+            .expect("Electrum may publish a server-asserted wallet after headers link");
+        assert_eq!(outcome.decision, ReconciliationDecision::Accepted);
+        let height = worker.header_verifier().unwrap().state().unwrap().height;
+        assert!(
+            height > genesis_height,
+            "Electrum must extend a real batch, not leave genesis unused: {height}"
+        );
+        let snapshot = worker
+            .reconciliation()
+            .authoritative
+            .as_ref()
+            .expect("accepted snapshot");
+        assert!(
+            matches!(snapshot.evidence, Evidence::ServerAssertion),
+            "linked headers must not relabel Electrum wallet evidence: {:?}",
+            snapshot.evidence
+        );
+        assert_ne!(
+            snapshot.value.tip.as_ref().map(|tip| tip.height),
+            Some(height),
+            "Electrum wallet tip is still a server assertion, not the verified header tip"
+        );
+    }
+
+    #[tokio::test]
+    async fn electrum_header_cap_stops_after_a_real_batch() {
+        let (verifier, headers) = header_fixture();
+        let config = ProgressiveSyncConfig {
+            header_batch_size: 1,
+            max_verified_headers_per_pass: Some(1),
+            ..Default::default()
+        };
+        let mut worker = ProgressiveSyncWorker::new(config)
+            .with_header_verifier(Network::Chipnet, verifier)
+            .unwrap();
+        let mut service = service_with_headers(
+            ProtocolFamily::Electrum,
+            headers.clone(),
+            0,
+            Evidence::ServerAssertion,
+        );
+        let route = service
+            .routes_for_operation(ChainOperation::WalletRefresh)
+            .remove(0);
+        worker
+            .prime_headers_on_same_route(&mut service, &route)
+            .await
+            .unwrap();
+        assert_eq!(
+            worker.header_verifier().unwrap().state().unwrap().height,
+            1,
+            "the cap must keep a real extended batch without walking the rest of the fixture"
+        );
     }
 
     #[tokio::test]
@@ -1166,6 +2253,8 @@ pub(crate) mod tests {
             header_start_height: 1,
             header_batch_size: 2,
             max_header_batches: 8,
+            max_verified_headers_per_pass: None,
+            ..Default::default()
         })
         .with_header_verifier(Network::Chipnet, verifier)
         .expect("a trusted verifier enables verified P2P sync");
@@ -1512,12 +2601,11 @@ pub(crate) mod tests {
             .with_header_verifier(Network::Chipnet, verifier)
             .unwrap()
             .with_accepted_headers(store.clone());
-        let mut service = service_with_header_locator(
+        let mut service = service_with_headers(
             ProtocolFamily::Bip37,
             headers.clone(),
             0,
             Evidence::ServerAssertion,
-            Some(store.clone()),
         );
         let route = service
             .routes_for_operation(ChainOperation::WalletRefresh)
@@ -1549,12 +2637,286 @@ pub(crate) mod tests {
         }
     }
 
-    /// A rejected later batch leaves both authorities at the accepted prefix.
+    /// Regtest headers for heights 1..=`end` from the shipped genesis. Above
+    /// `fork`, another branch: other merkle roots, so other blocks.
+    pub(crate) fn regtest_headers(end: u32, fork: Option<u32>) -> Vec<[u8; 80]> {
+        let max_bits = optn_core::asert::AsertParams::for_network(Network::Regtest).max_bits;
+        regtest_headers_with(end, fork, |_| max_bits)
+    }
+
+    /// As [`regtest_headers`], each block declaring `bits_at(height)`.
+    /// Regtest does not retarget, so a harder target is allowed and weighs
+    /// more.
+    fn regtest_headers_with(
+        end: u32,
+        fork: Option<u32>,
+        bits_at: impl Fn(u32) -> u32,
+    ) -> Vec<[u8; 80]> {
+        use optn_core::header_pow::verify_declared_pow;
+
+        let verifier = shipped_header_verifier(Network::Regtest).expect("regtest genesis");
+        let mut previous = verifier.last_hash().expect("regtest genesis hash");
+        let genesis_time = verifier.last_time().expect("regtest genesis time");
+        let mut headers = Vec::new();
+        for height in 1..=end {
+            let mut header = [0u8; 80];
+            header[0..4].copy_from_slice(&1u32.to_le_bytes());
+            header[4..36].copy_from_slice(&previous);
+            let root = if fork.is_some_and(|fork| height > fork) {
+                !(height as u8)
+            } else {
+                height as u8
+            };
+            header[36..68].copy_from_slice(&[root; 32]);
+            header[68..72]
+                .copy_from_slice(&genesis_time.saturating_add(height * 600).to_le_bytes());
+            header[72..76].copy_from_slice(&bits_at(height).to_le_bytes());
+            let nonce = (0u32..1_000_000)
+                .find(|nonce| {
+                    header[76..80].copy_from_slice(&nonce.to_le_bytes());
+                    verify_declared_pow(&header).is_ok()
+                })
+                .expect("regtest fixture header must satisfy proof of work");
+            header[76..80].copy_from_slice(&nonce.to_le_bytes());
+            previous = optn_core::header_hash::sha256d(&header);
+            headers.push(header);
+        }
+        headers
+    }
+
+    /// A worker on regtest genesis with an accepted store, after one header
+    /// pass along `headers` from `protocol`.
+    async fn worker_along(
+        protocol: ProtocolFamily,
+        headers: Vec<[u8; 80]>,
+    ) -> (ProgressiveSyncWorker, Arc<SharedHeaders>) {
+        let verifier = shipped_header_verifier(Network::Regtest).unwrap();
+        // Seeded with genesis, as the host's accepted store is.
+        let genesis = verifier.last_hash().unwrap();
+        let store = Arc::new(SharedHeaders::default());
+        store.write(|retained| retained.insert_hash_only(0, genesis));
+        let mut worker = ProgressiveSyncWorker::new(ProgressiveSyncConfig::default())
+            .with_header_verifier(Network::Regtest, verifier)
+            .unwrap()
+            .with_accepted_headers(store.clone());
+        header_pass(&mut worker, protocol, headers).await.unwrap();
+        (worker, store)
+    }
+
+    async fn header_pass(
+        worker: &mut ProgressiveSyncWorker,
+        protocol: ProtocolFamily,
+        headers: Vec<[u8; 80]>,
+    ) -> Result<(), ProgressiveSyncError> {
+        let mut service = service_with_headers(protocol, headers, 0, Evidence::ServerAssertion);
+        let route = service
+            .routes_for_operation(ChainOperation::WalletRefresh)
+            .remove(0);
+        worker
+            .prime_headers_on_same_route(&mut service, &route)
+            .await
+    }
+
+    fn straight_view(headers: &[[u8; 80]]) -> VerifiedHeaderView {
+        let mut view = VerifiedHeaderView::new(
+            Network::Regtest,
+            shipped_header_verifier(Network::Regtest).unwrap(),
+        );
+        view.extend(
+            &headers
+                .iter()
+                .copied()
+                .map(BlockHeaderBytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        view
+    }
+
+    /// A source on another branch that left this chain within the window:
+    /// the view rolls back to the fork and follows the branch with more work,
+    /// with no manual rebuild. The store drops the orphaned blocks and takes
+    /// the new ones, so its generation moves.
     #[tokio::test]
-    async fn a_rejected_header_batch_preserves_only_the_verified_prefix() {
+    async fn a_reorg_within_the_window_is_followed_without_a_rebuild() {
+        use crate::header_store::BlockHeaderSource;
+
+        for protocol in [ProtocolFamily::Electrum, ProtocolFamily::Bip37] {
+            for depth in [1u32, 3] {
+                let old = regtest_headers(8, None);
+                let fork = 8 - depth;
+                let new = regtest_headers(9, Some(fork));
+                let (mut worker, store) = worker_along(protocol, old.clone()).await;
+                let generation = store.generation();
+                assert_eq!(
+                    worker.header_view().unwrap().tip(),
+                    straight_view(&old).tip()
+                );
+
+                header_pass(&mut worker, protocol, new.clone())
+                    .await
+                    .unwrap_or_else(|error| panic!("{protocol:?} depth {depth}: {error:?}"));
+
+                let view = worker.header_view().unwrap();
+                let expected = straight_view(&new);
+                assert_eq!(view.tip(), expected.tip(), "{protocol:?} depth {depth}");
+                assert_eq!(view.checkpoint(), expected.checkpoint());
+                assert_ne!(view.checkpoint(), straight_view(&old).checkpoint());
+                assert_eq!(store.tip(), expected.tip());
+                assert_eq!(
+                    store.hash_at(fork),
+                    Some(optn_core::header_hash::sha256d(&old[fork as usize - 1]))
+                );
+                assert_eq!(
+                    store.hash_at(fork + 1),
+                    Some(optn_core::header_hash::sha256d(&new[fork as usize]))
+                );
+                assert_ne!(store.generation(), generation, "readers see the reorg");
+            }
+        }
+    }
+
+    /// A longer branch with less work than the blocks it would replace is not
+    /// followed, and nothing is written: length is not what decides.
+    #[tokio::test]
+    async fn a_branch_with_less_work_is_not_followed() {
+        use crate::header_store::BlockHeaderSource;
+
+        let easy = optn_core::asert::AsertParams::for_network(Network::Regtest).max_bits;
+        // Sixteen times the work of an easy block, still within regtest's limit.
+        let hard = 0x2007_ffff;
+        let old = regtest_headers_with(8, None, |height| if height > 5 { hard } else { easy });
+        let (mut worker, store) = worker_along(ProtocolFamily::Bip37, old).await;
+        let before = (worker.header_view().unwrap().checkpoint(), store.tip());
+        assert_eq!(
+            header_pass(
+                &mut worker,
+                ProtocolFamily::Bip37,
+                regtest_headers(9, Some(5))
+            )
+            .await,
+            Err(ProgressiveSyncError::ReorgWithLessWork { fork: 5 })
+        );
+        assert_eq!(
+            (worker.header_view().unwrap().checkpoint(), store.tip()),
+            before
+        );
+    }
+
+    /// A fork below the reorg window is refused, as BCHN refuses to reorg
+    /// past a finalized block.
+    #[tokio::test]
+    async fn a_fork_below_the_window_is_refused() {
+        let old = regtest_headers(20, None);
+        let (mut worker, _) = worker_along(ProtocolFamily::Bip37, old).await;
+        let before = worker.header_view().unwrap().checkpoint();
+        assert_eq!(
+            header_pass(
+                &mut worker,
+                ProtocolFamily::Bip37,
+                regtest_headers(25, Some(5))
+            )
+            .await,
+            Err(ProgressiveSyncError::ReorgBeyondWindow {
+                floor: 20 - crate::header_view::REORG_WINDOW
+            })
+        );
+        assert_eq!(worker.header_view().unwrap().checkpoint(), before);
+    }
+
+    /// A view sealed before reorg rings were kept, whose tip was then
+    /// orphaned, follows the chain again. Found live on chipnet: a one-block
+    /// orphan at 325,540 held every wallet's headers there, because the
+    /// restored view could not step back even one block. One block of ring is
+    /// rebuilt from the tip's own proof; a deeper fork is still refused.
+    #[tokio::test]
+    async fn a_view_sealed_without_a_ring_follows_a_one_block_orphan() {
+        let old = regtest_headers(10, None);
+        let ringless = || {
+            let view = straight_view(&old);
+            let trusted = view.checkpoint();
+            let mut record: serde_json::Value =
+                serde_json::from_str(&view.encode().unwrap()).unwrap();
+            record["ring"] = serde_json::Value::Null;
+            let restored =
+                VerifiedHeaderView::restore(&record.to_string(), Network::Regtest, &trusted)
+                    .unwrap();
+            assert_eq!(restored.rollback_floor(), None, "no ring came back");
+            ProgressiveSyncWorker::new(ProgressiveSyncConfig::default())
+                .with_header_view(restored)
+                .unwrap()
+        };
+
+        for protocol in [ProtocolFamily::Electrum, ProtocolFamily::Bip37] {
+            let new = regtest_headers(14, Some(9));
+            let mut worker = ringless();
+            header_pass(&mut worker, protocol, new.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{protocol:?}: {error:?}"));
+            let view = worker.header_view().unwrap();
+            assert_eq!(
+                view.checkpoint(),
+                straight_view(&new).checkpoint(),
+                "{protocol:?}"
+            );
+            // What it seals now carries a ring, so a later orphan is followed
+            // the ordinary way.
+            let restored = VerifiedHeaderView::restore(
+                &view.encode().unwrap(),
+                Network::Regtest,
+                &view.checkpoint(),
+            )
+            .unwrap();
+            assert!(restored.rollback_floor().is_some_and(|floor| floor < 14));
+        }
+
+        // Two orphaned blocks: the tip vouches only for its own parent.
+        let mut worker = ringless();
+        let before = worker.header_view().unwrap().checkpoint();
+        assert_eq!(
+            header_pass(
+                &mut worker,
+                ProtocolFamily::Electrum,
+                regtest_headers(14, Some(8))
+            )
+            .await,
+            Err(ProgressiveSyncError::HeaderVerification(
+                ShvMmrError::ParentMismatch
+            ))
+        );
+        assert_eq!(worker.header_view().unwrap().checkpoint(), before);
+    }
+
+    /// After a reorg, the sealed view brings back the new tip, not the
+    /// orphaned one, and can still roll back across the fork.
+    #[tokio::test]
+    async fn a_restart_after_a_reorg_keeps_the_new_tip() {
+        let old = regtest_headers(8, None);
+        let new = regtest_headers(9, Some(6));
+        let (mut worker, _) = worker_along(ProtocolFamily::Bip37, old).await;
+        header_pass(&mut worker, ProtocolFamily::Bip37, new.clone())
+            .await
+            .unwrap();
+        let view = worker.header_view().unwrap();
+        let trusted = view.checkpoint();
+        let restored =
+            VerifiedHeaderView::restore(&view.encode().unwrap(), Network::Regtest, &trusted)
+                .unwrap();
+        assert_eq!(restored.tip(), straight_view(&new).tip());
+        assert!(restored.rollback_floor().is_some_and(|floor| floor < 6));
+    }
+
+    /// A rejected pass advances neither half.
+    ///
+    /// The first batch verifies and the second does not. Publishing the first
+    /// anyway would leave the store holding headers the view never accepted,
+    /// which is the split-authority this store exists to prevent.
+    #[tokio::test]
+    async fn a_rejected_header_pass_publishes_nothing() {
         use crate::header_store::BlockHeaderSource;
 
         let (verifier, headers) = header_fixture();
+        let initial = verifier.state().unwrap();
         let config = ProgressiveSyncConfig {
             header_batch_size: 1,
             ..Default::default()
@@ -1581,13 +2943,13 @@ pub(crate) mod tests {
             .await
             .is_err());
 
-        assert_eq!(worker.header_verifier().unwrap().state().unwrap().height, 1);
-        assert_eq!(store.retained_span(), Some((1, 1)));
+        assert_eq!(worker.header_verifier().unwrap().state().unwrap(), initial);
         assert_eq!(
-            store.tip(),
-            worker.header_view().and_then(VerifiedHeaderView::tip)
+            store.retained_span(),
+            None,
+            "a failed header pass published headers into the accepted store"
         );
-        assert_eq!(store.hash_at(2), None);
+        assert_eq!(store.tip(), None);
     }
 
     /// A floor and a baseline are different requests.
