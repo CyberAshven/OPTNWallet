@@ -23,13 +23,11 @@ k256 = { version = "0.14", default-features = false, features = ["ecdsa", "ecdh"
 bip32 = { version = "0.6", default-features = false, features = ["alloc", "secp256k1"] }
 # "rand_core", not "rand": hd::generate_mnemonic calls bip39's own generator
 # with rand_core's OsRng, the OS CSPRNG read directly. "rand" would add
-# generate(), which draws from rand's userspace thread_rng instead.
+# generate(), which draws from rand's userspace thread_rng instead. rand_core
+# 0.6 is the API used by bip39; k256 0.14 carries a newer incompatible
+# rand_core, so keep this dependency explicit.
+rand_core = { version = "0.6", features = ["getrandom"] }
 bip39 = { version = "2", default-features = false, features = ["std", "zeroize", "rand_core"] }
-# bip39's generator takes rand_core 0.6 traits (every release, 3.0 included),
-# and the rand_core 0.10 under k256 0.14 no longer has OsRng. This is the 0.6
-# OsRng that k256 0.13 used to supply; on wasm32 it reads getrandom 0.2,
-# which the target section below points at crypto.getRandomValues.
-rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 # CashFusion's Jacobi test is a modpow over the secp256k1 FIELD prime, which
 # k256 does not expose. Both pure Rust and wasm-safe, and the same crates the
 # desktop implementation already used -- so this is a move, not a reimplementation.
